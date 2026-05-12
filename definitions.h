@@ -1,11 +1,9 @@
 #ifndef DEFINITIONS_H
 #define DEFINITIONS_H
 
-// ── Kart ──────────────────────────────────────────────────────────────────────
-#define BOARD_BW16          // Ai-Thinker BW16 (RTL8720DN)
+#define BOARD_BW16
 
-// ── LED ───────────────────────────────────────────────────────────────────────
-#define LED_PIN  10         // BW16 dahili LED pini (aktif-LOW)
+#define LED_PIN  10
 
 inline void led_init()  { pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH); }
 inline void led_on()    { digitalWrite(LED_PIN, LOW);  }
@@ -18,7 +16,6 @@ inline void led_blink(int n, int ms) {
   }
 }
 
-// ── Seri debug ────────────────────────────────────────────────────────────────
 #define DBG(...)   Serial.print(__VA_ARGS__)
 #define DBGLN(...) Serial.println(__VA_ARGS__)
 

@@ -1,8 +1,10 @@
-// ─── BW16 RTL8720DN — Wi-Fi Güvenlik Aracı ───────────────────────────────────
-// Arduino IDE: Ai-Thinker BW16 (RTL8720DN) kartını seçin
-// Seri monitör: 115200 baud
+// ─── BW16 RTL8720DN — Wi-Fi Guvenlik Araci ───────────────────────────────────
+// Arduino IDE: Ai-Thinker BW16 (RTL8720DN) kartini secin
+// Seri monitor: 115200 baud
 //
-// ADIM 5 — Deauth: WiFi istemcilerini bağlantıdan düşür
+// KURULUM (bir kez yapilir):
+//   1. patch_lib.bat dosyasini yonetici olarak calistirin.
+//   2. Ardindan bu projeyi derleyip yukleyin.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
@@ -12,7 +14,7 @@
 #include "web_interface.h"
 #include "deauth.h"
 
-#define AP_SSID "BW16-Test"
+#define AP_SSID "BW16-Guvenlik"
 #define AP_PASS "12345678"
 #define AP_CH   1
 
@@ -21,19 +23,24 @@ void setup() {
   delay(800);
 
   DBGLN(F("\n========================================"));
-  DBGLN(F("  BW16 RTL8720DN — Güvenlik Aracı"));
-  DBGLN(F("  ADIM 5: Deauth"));
+  DBGLN(F("  BW16 RTL8720DN - Guvenlik Araci"));
   DBGLN(F("========================================"));
 
   led_init();
-  DBGLN(F("[1/3] LED hazır"));
 
-  DBG(F("[2/3] AP -> ")); DBGLN(F(AP_SSID));
+  // AP'yi baslat
+  DBG(F("[1/3] AP baslatiliyor -> ")); DBGLN(F(AP_SSID));
   wifi_ap_start(AP_SSID, AP_PASS, AP_CH);
-  DBG(F("      IP : ")); DBGLN(WiFi.localIP());
+  DBG(F("      IP: ")); DBGLN(WiFi.localIP());
 
+  // AP basladiktan sonra tarama yap
+  DBGLN(F("[2/3] Aglar taraniyor..."));
+  scan_networks();
+  DBG(F("      Bulunan ag: ")); DBGLN(net_count);
+
+  // Web sunucuyu baslat
   web_begin();
-  DBGLN(F("[3/3] HTTP sunucu hazır"));
+  DBGLN(F("[3/3] HTTP sunucu hazir"));
 
   DBGLN(F("========================================"));
   DBG(F("  http://")); DBGLN(WiFi.localIP());
@@ -44,7 +51,7 @@ void setup() {
 
 void loop() {
   WiFi.disablePowerSave();
-  deauth_loop();    // aktifse deauth paketleri gönder
-  web_handle();     // HTTP isteklerini işle
+  deauth_loop();
+  web_handle();
   delay(5);
 }
