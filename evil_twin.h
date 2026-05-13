@@ -35,6 +35,9 @@ extern int        et_password_count;
 extern bool       et_last_verify_ok;
 extern String     et_last_verify_pass;
 
+// ─── Yardımcı fonksiyonlar ───────────────────────────────────────────────────
+String et_html_escape(const String &s);
+
 // ─── Fonksiyon bildirimleri ───────────────────────────────────────────────────
 void start_evil_twin(int scan_idx);
 void stop_evil_twin();
