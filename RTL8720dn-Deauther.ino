@@ -17,7 +17,7 @@ char *pass = "20192019";
 // Hedef kanal yenileme aralığı (ms)
 #define RESCAN_INTERVAL_MS    30000UL
 // İstemci okuma zaman aşımı (ms) — POST body ayrı TCP parçasında gelebilir
-#define CLIENT_TIMEOUT_MS     300
+#define CLIENT_TIMEOUT_MS     50
 
 // Yaygın kanal listeleri (çift bant tahmini için)
 static const uint8_t COMMON_5GHZ[]  = {36, 40, 44, 48, 149, 153, 157, 161};
@@ -216,7 +216,7 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
 int scanNetworks() {
   scan_results.clear();
   if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
-    delay(5000);
+    delay(3000);
     updateTargetChannels();
     last_rescan_ms = millis();
     return 0;
@@ -573,8 +573,12 @@ void handle404(WiFiClient &client) {
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-  // AmebaD SDK: WiFi.apbegin() öncesi mevcut bağlantı kesilmeli.
-  // Not: disableSTA() bazı AmebaD core sürümlerinde yoktur; disconnect() yeterlidir.
+  // delfyRTL (gorebrau) referans: WiFi.enableConcurrent() STA+AP eş zamanlı
+  // çalışmasını etkinleştirir. Bu olmadan STA tarama sırasında AP çakışabilir.
+  WiFi.enableConcurrent();
+  delay(100);
+
+  // Yönetim AP'sini başlat (şifreli — sadece yönetim erişimi için)
   WiFi.disconnect();
   delay(300);
   WiFi.apbegin(ssid, pass, "1");

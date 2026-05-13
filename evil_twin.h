@@ -8,7 +8,7 @@
 #define ET_MAX_PASSWORDS       20
 #define ET_AP_IP_STR           "192.168.1.1"
 #define ET_DEAUTH_INTERVAL_MS  200UL      // Deauth burst aralığı (ms) — daha agresif
-#define ET_VERIFY_TIMEOUT_MS   12000UL   // Şifre doğrulama zaman aşımı (ms)
+#define ET_VERIFY_TIMEOUT_MS   8000UL    // Şifre doğrulama zaman aşımı (ms)
 #define ET_RETRACK_INTERVAL_MS 30000UL   // Hedef yeniden tarama aralığı (ms)
 
 // ─── Kaydedilen şifre yapısı ──────────────────────────────────────────────────

