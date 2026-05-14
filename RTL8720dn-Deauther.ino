@@ -284,28 +284,42 @@ void handleRoot(WiFiClient &client) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Deauther</title>
     <style>
-      body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 960px; margin: 0 auto; padding: 20px; background: #f4f4f4; }
-      h1, h2 { color: #2c3e50; }
-      table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-      th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #ddd; }
+      *, *::before, *::after { box-sizing: border-box; }
+      body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 960px; margin: 0 auto; padding: 12px; background: #f4f4f4; }
+      h1 { font-size: clamp(1.2rem, 5vw, 1.8rem); color: #2c3e50; margin-bottom: 10px; }
+      h2 { font-size: clamp(1rem, 4vw, 1.4rem); color: #2c3e50; }
+      .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; margin-bottom: 20px; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,.08); }
+      table { width: 100%; border-collapse: collapse; min-width: 480px; }
+      th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid #ddd; white-space: nowrap; font-size: 0.9em; }
       th { background: #2c3e50; color: #fff; }
       tr:nth-child(even) { background: #f0f0f0; }
-      .group-header td { background: #dce8f5; font-weight: bold; font-size: 0.85em; color: #1a252f; padding: 4px 12px; }
+      .group-header td { background: #dce8f5; font-weight: bold; font-size: 0.82em; color: #1a252f; padding: 5px 10px; white-space: normal; }
       .row-2g { background: #eaf4fb !important; border-left: 4px solid #3498db; }
       .row-5g { background: #eafbf1 !important; border-left: 4px solid #27ae60; }
       .badge { display:inline-block; padding:2px 7px; border-radius:3px; font-size:.78em; font-weight:bold; color:#fff; }
       .b2g { background:#3498db; } .b5g { background:#27ae60; }
-      form { background:#fff; padding:20px; border-radius:6px; box-shadow:0 2px 5px rgba(0,0,0,.1); margin-bottom:20px; }
-      input[type=submit] { padding:10px 22px; border:none; border-radius:4px; cursor:pointer; font-size:1em; color:#fff; transition:background .2s; }
-      .btn-attack  { background:#e74c3c; } .btn-attack:hover  { background:#c0392b; }
-      .btn-stop    { background:#e67e22; } .btn-stop:hover    { background:#ca6f1e; }
-      .btn-rescan  { background:#3498db; } .btn-rescan:hover  { background:#2980b9; }
-      input[type=text] { padding:7px; border:1px solid #ccc; border-radius:4px; width:90px; margin-right:8px; }
-      .cb-grp  { transform:scale(1.3); cursor:pointer; accent-color:#8e44ad; }
-      .cb-net  { transform:scale(1.2); cursor:pointer; }
-      .status-bar { padding:10px 16px; border-radius:5px; margin-bottom:16px; font-weight:bold; }
+      form { background:#fff; padding:14px 16px; border-radius:6px; box-shadow:0 2px 5px rgba(0,0,0,.1); margin-bottom:16px; }
+      input[type=submit] { padding:12px 20px; border:none; border-radius:4px; cursor:pointer; font-size:1em; color:#fff; transition:background .2s; touch-action:manipulation; min-height:44px; }
+      .btn-attack  { background:#e74c3c; } .btn-attack:hover, .btn-attack:active { background:#c0392b; }
+      .btn-stop    { background:#e67e22; } .btn-stop:hover,   .btn-stop:active   { background:#ca6f1e; }
+      .btn-rescan  { background:#3498db; } .btn-rescan:hover, .btn-rescan:active  { background:#2980b9; }
+      .btn-row { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:16px; }
+      .btn-row form { margin:0; padding:0; background:none; box-shadow:none; }
+      input[type=text] { padding:8px; border:1px solid #ccc; border-radius:4px; width:90px; margin-right:8px; }
+      .cb-grp  { transform:scale(1.4); cursor:pointer; accent-color:#8e44ad; min-width:20px; min-height:20px; }
+      .cb-net  { transform:scale(1.3); cursor:pointer; min-width:20px; min-height:20px; }
+      .status-bar { padding:10px 14px; border-radius:5px; margin-bottom:14px; font-weight:bold; font-size:0.95em; }
       .status-on  { background:#fdecea; border:1px solid #e74c3c; color:#c0392b; }
       .status-off { background:#eafaf1; border:1px solid #27ae60; color:#1e8449; }
+      .info-text { font-size:.85em; color:#555; }
+      @media (max-width: 600px) {
+        body { padding: 8px; }
+        th, td { padding: 7px 6px; font-size: 0.8em; }
+        input[type=submit] { width: 100%; }
+        .btn-row { flex-direction: column; }
+        h1 { font-size: 1.2rem; }
+        h2 { font-size: 1rem; }
+      }
     </style>
     <script>
       function toggleGroup(id) {
@@ -326,15 +340,17 @@ void handleRoot(WiFiClient &client) {
   }
 
   // Stop / rescan row
-  response += "<form method='post' action='/stop' style='display:inline-block;margin-right:10px;padding:10px 16px;'>";
+  response += "<div class='btn-row'>";
+  response += "<form method='post' action='/stop'>";
   response += "<input class='btn-stop' type='submit' value='&#9632; Stop Attack'></form>";
-  response += "<form method='post' action='/rescan' style='display:inline-block;padding:10px 16px;'>";
-  response += "<input class='btn-rescan' type='submit' value='&#8635; Rescan Networks'></form><br><br>";
+  response += "<form method='post' action='/rescan'>";
+  response += "<input class='btn-rescan' type='submit' value='&#8635; Rescan Networks'></form>";
+  response += "</div>";
 
   // Network table
   response += "<h2>WiFi Networks</h2>";
   response += "<form method='post' action='/deauth'>";
-  response += "<table><tr><th>Grp</th><th>Sel</th><th>#</th><th>SSID</th><th>BSSID</th><th>Ch</th><th>RSSI</th><th>Band</th></tr>";
+  response += "<div class='table-wrap'><table><tr><th>Grp</th><th>Sel</th><th>#</th><th>SSID</th><th>BSSID</th><th>Ch</th><th>RSSI</th><th>Band</th></tr>";
 
   std::vector<bool> rendered(scan_results.size(), false);
   int group_id = 0;
@@ -393,13 +409,13 @@ void handleRoot(WiFiClient &client) {
     }
   }
 
-  response += "</table>";
-  response += "<p style='font-size:.85em;color:#555;'>Her saldırı burst'ünde tüm reason code'lar otomatik gönderilir: <b>2, 3, 4, 6, 8</b> (Deauth) + <b>2, 3, 8</b> (Disassoc) &mdash; iOS, Android ve Windows için eş zamanlı.</p>";
+  response += "</table></div>";
+  response += "<p class='info-text'>Her saldırı burst'ünde tüm reason code'lar otomatik gönderilir: <b>2, 3, 4, 6, 8</b> (Deauth) + <b>2, 3, 8</b> (Disassoc) &mdash; iOS, Android ve Windows için eş zamanlı.</p>";
   response += "<input class='btn-attack' type='submit' value='&#9889; Launch Attack'></form>";
 
   // Active targets section
   if (attacking) {
-    response += "<h2>Active Targets</h2><table>";
+    response += "<h2>Active Targets</h2><div class='table-wrap'><table>";
     response += "<tr><th>#</th><th>SSID</th><th>Primary BSSID</th><th>Ch</th><th>Pair BSSID</th><th>Pair Ch</th></tr>";
     for (uint32_t i = 0; i < deauth_targets.size(); i++) {
       char pbssid[18] = "—";
@@ -425,12 +441,12 @@ void handleRoot(WiFiClient &client) {
       response += "<td>" + pch + "</td>";
       response += "</tr>";
     }
-    response += "</table>";
+    response += "</table></div>";
   }
 
   response += R"(
     <h2>Evrensel Saldırı Matrisi (Her Burst)</h2>
-    <table>
+    <div class='table-wrap'><table>
       <tr><th>Frame Tipi</th><th>Miktar</th><th>Mekanizma</th><th>Hedef Platform</th></tr>
       <tr>
         <td>Deauth 0xC0</td><td>reason 2,3,4,6,8 &times;50</td>
@@ -472,8 +488,8 @@ void handleRoot(WiFiClient &client) {
         <td>Ard&iacute;&scaron;ık 2 geçersiz kanal — s&uuml;r&uuml;c&uuml; hi&ccedil;birine yerle&scaron;emez</td>
         <td><b>Windows ✓ &nbsp; TP-Link/Realtek USB ✓</b></td>
       </tr>
-    </table>
-    <p style="font-size:.85em;color:#666;">
+    </table></div>
+    <p class="info-text">
       <b>~777 frame/kanal &bull; kanal ge&ccedil;i&scaron;i sadece kanal de&gti;i&scaron;ince &bull; delay=0 &bull; TX g&uuml;c&uuml; %100 &bull; power-save kapal&iacute;</b>
     </p>
   </body></html>)";
